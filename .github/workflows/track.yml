@@ -1,0 +1,56 @@
+name: Track Skin Prices
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Spike alert threshold (%)"
+        default: "20"
+      days:
+        description: "Rolling average window (days)"
+        default: "7"
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Restore the SQLite DB from the previous run so history accumulates
+      - name: Restore price database
+        uses: actions/cache@v4
+        with:
+          path: skintel.db
+          key: skintel-db-${{ github.run_id }}
+          restore-keys: |
+            skintel-db-
+
+      - name: Run tracker
+        env:
+          STEAM_ID: ${{ secrets.STEAM_ID }}
+        run: |
+          python tracker.py run \
+            --steam-id "$STEAM_ID" \
+            --threshold ${{ github.event.inputs.threshold || '20' }} \
+            --days ${{ github.event.inputs.days || '7' }}
+
+      # Always save the DB, even if the run step fails
+      - name: Save price database
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: skintel.db
+          key: skintel-db-${{ github.run_id }}
