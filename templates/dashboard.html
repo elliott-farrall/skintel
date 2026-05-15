@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Skintel</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a0a;
+      color: #d4d4d4;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+    }
+
+    /* ── Header ────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1f1f1f;
+      position: sticky;
+      top: 0;
+      background: #0a0a0a;
+      z-index: 10;
+    }
+
+    header h1 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: #4ade80;
+      letter-spacing: -0.3px;
+      flex-shrink: 0;
+    }
+
+    #meta {
+      color: #555;
+      font-size: 0.8rem;
+      flex: 1;
+    }
+
+    .btn {
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 600;
+      transition: opacity 0.15s;
+      flex-shrink: 0;
+    }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn:not(:disabled):hover { opacity: 0.8; }
+    .btn-run  { background: #4ade80; color: #000; }
+    .btn-steam {
+      background: transparent;
+      color: #7ec8e3;
+      border: 1px solid #1e3a4a;
+      font-size: 0.75rem;
+    }
+
+    /* ── Alert bar ─────────────────────────────────────────── */
+    #alert-bar {
+      display: none;
+      padding: 0.6rem 1.5rem;
+      background: #1c1500;
+      border-bottom: 1px solid #2e2200;
+      font-size: 0.82rem;
+      color: #fbbf24;
+    }
+
+    /* ── Grid ──────────────────────────────────────────────── */
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 1rem;
+      padding: 1.25rem 1.5rem;
+    }
+
+    /* ── Card ──────────────────────────────────────────────── */
+    .card {
+      background: #111;
+      border: 1px solid #1e1e1e;
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+    }
+
+    .card.alerted {
+      border-color: #22543d;
+      box-shadow: 0 0 0 1px #4ade8015;
+    }
+
+    .card-name {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #e2e2e2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .prices {
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .price-block {}
+
+    .plabel {
+      font-size: 0.68rem;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.15rem;
+    }
+
+    .pval {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #4ade80;
+    }
+
+    .pval.dim { color: #666; font-size: 0.9rem; }
+
+    .chart-wrap {
+      height: 72px;
+      position: relative;
+    }
+
+    .badges {
+      display: flex;
+      gap: 0.35rem;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      font-size: 0.67rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0.18rem 0.45rem;
+      border-radius: 4px;
+    }
+
+    .badge-spike  { background: #3b0764; color: #c084fc; border: 1px solid #6b21a8; }
+    .badge-ath    { background: #450a0a; color: #f87171; border: 1px solid #991b1b; }
+    .badge-surge  { background: #431407; color: #fb923c; border: 1px solid #9a3412; }
+
+    .card-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: auto;
+    }
+
+    .vol { font-size: 0.72rem; color: #444; }
+
+    /* ── States ────────────────────────────────────────────── */
+    #loading, #empty {
+      padding: 5rem 1.5rem;
+      text-align: center;
+      color: #444;
+      font-size: 0.9rem;
+    }
+    #empty { display: none; }
+
+    .spinner {
+      display: inline-block;
+      width: 18px; height: 18px;
+      border: 2px solid #333;
+      border-top-color: #4ade80;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.5rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Skintel</h1>
+  <div id="meta">Loading…</div>
+  <button class="btn btn-run" id="run-btn" onclick="triggerRun()">Run Now</button>
+</header>
+
+<div id="alert-bar"></div>
+<div id="loading"><span class="spinner"></span>Loading inventory…</div>
+<div id="empty">No skins tracked yet — click Run Now to fetch prices.</div>
+<div id="grid"></div>
+
+<script>
+const STEAM_ID = {{ steam_id | tojson }};
+
+async function load() {
+  let skins;
+  try {
+    const res = await fetch("/api/skins");
+    if (!res.ok) throw new Error(res.status);
+    skins = await res.json();
+  } catch (e) {
+    document.getElementById("loading").textContent = "Failed to load data.";
+    return;
+  }
+
+  document.getElementById("loading").style.display = "none";
+
+  if (!skins.length) {
+    document.getElementById("empty").style.display = "block";
+    return;
+  }
+  document.getElementById("empty").style.display = "none";
+
+  // Alert bar
+  const alerted = skins.filter(s => s.alerts.length > 0);
+  const bar = document.getElementById("alert-bar");
+  if (alerted.length) {
+    bar.style.display = "block";
+    bar.textContent =
+      `🔔 ${alerted.length} skin${alerted.length > 1 ? "s" : ""} with active price alerts`;
+  } else {
+    bar.style.display = "none";
+  }
+
+  // Last updated timestamp
+  const timestamps = skins.map(s => s.fetched_at).filter(Boolean);
+  const latest = timestamps.sort().at(-1);
+  document.getElementById("meta").textContent = latest
+    ? `Last updated ${new Date(latest + "Z").toLocaleString()}`
+    : "No price data yet";
+
+  const grid = document.getElementById("grid");
+
+  // Destroy old charts before re-rendering
+  Chart.helpers.each(Chart.instances, c => c.destroy());
+  grid.innerHTML = "";
+
+  for (const skin of skins) {
+    grid.appendChild(buildCard(skin));
+  }
+
+  for (const skin of skins) {
+    loadChart(skin.id);
+  }
+}
+
+function buildCard(skin) {
+  const hasAlerts = skin.alerts.length > 0;
+  const alertTypes = [...new Set(skin.alerts.map(a => a.alert_type))];
+
+  const card = document.createElement("div");
+  card.className = "card" + (hasAlerts ? " alerted" : "");
+
+  const median  = skin.median_price  != null ? `$${skin.median_price.toFixed(2)}`  : "—";
+  const lowest  = skin.lowest_price  != null ? `$${skin.lowest_price.toFixed(2)}`  : "—";
+
+  const badgesHtml = alertTypes.map(t => {
+    if (t === "spike")        return `<span class="badge badge-spike">Spike</span>`;
+    if (t === "all_time_high") return `<span class="badge badge-ath">ATH</span>`;
+    if (t === "volume_surge") return `<span class="badge badge-surge">Vol Surge</span>`;
+    return "";
+  }).join("");
+
+  const inventoryUrl =
+    `https://steamcommunity.com/profiles/${STEAM_ID}/inventory/#730`;
+
+  card.innerHTML = `
+    <div class="card-name" title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
+    <div class="prices">
+      <div class="price-block">
+        <div class="plabel">Median</div>
+        <div class="pval">${median}</div>
+      </div>
+      <div class="price-block">
+        <div class="plabel">Lowest</div>
+        <div class="pval dim">${lowest}</div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="chart-${skin.id}"></canvas>
+    </div>
+    ${badgesHtml ? `<div class="badges">${badgesHtml}</div>` : ""}
+    <div class="card-footer">
+      <span class="vol">${skin.volume != null ? `Vol: ${skin.volume.toLocaleString()}` : ""}</span>
+      <a href="${inventoryUrl}" target="_blank" class="btn btn-steam">Open Inventory ↗</a>
+    </div>
+  `;
+  return card;
+}
+
+async function loadChart(skinId) {
+  let data;
+  try {
+    const res = await fetch(`/api/skins/${skinId}/history`);
+    if (!res.ok) return;
+    data = await res.json();
+  } catch { return; }
+  if (!data.length) return;
+
+  const canvas = document.getElementById(`chart-${skinId}`);
+  if (!canvas) return;
+
+  const prices = data.map(d => d.median_price);
+  const min = Math.min(...prices.filter(p => p != null)) * 0.97;
+  const max = Math.max(...prices.filter(p => p != null)) * 1.03;
+
+  new Chart(canvas, {
+    type: "line",
+    data: {
+      labels: data.map(d => d.fetched_at),
+      datasets: [{
+        data: prices,
+        borderColor: "#4ade80",
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+        fill: true,
+        backgroundColor: "rgba(74,222,128,0.06)",
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          enabled: true,
+          callbacks: {
+            label: ctx => ctx.parsed.y != null ? `$${ctx.parsed.y.toFixed(2)}` : "",
+            title: ctx => ctx[0]?.label?.slice(0, 16) ?? "",
+          },
+        },
+      },
+      scales: {
+        x: { display: false },
+        y: { display: false, min, max },
+      },
+    },
+  });
+}
+
+async function triggerRun() {
+  const btn = document.getElementById("run-btn");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span>Running…`;
+
+  try {
+    const res = await fetch("/api/run", { method: "POST" });
+    const data = await res.json();
+    if (data.status === "already_running") {
+      btn.textContent = "Already running";
+      setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 3000);
+      return;
+    }
+    // Poll status until done, then reload
+    pollUntilDone();
+  } catch {
+    btn.disabled = false;
+    btn.textContent = "Run Now";
+  }
+}
+
+async function pollUntilDone() {
+  const btn = document.getElementById("run-btn");
+  while (true) {
+    await sleep(5000);
+    try {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      if (!data.running) {
+        await load();
+        btn.disabled = false;
+        btn.textContent = "Run Now";
+        return;
+      }
+    } catch { /* keep polling */ }
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function esc(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+load();
+setInterval(load, 5 * 60 * 1000);
+</script>
+
+</body>
+</html>
