@@ -123,7 +123,11 @@ def _inventory_via_econ_api(steam_id: str) -> list[dict]:
         )
     resp.raise_for_status()
 
-    data = resp.json().get("response", {})
+    raw = resp.json()
+    log.info("Raw response top-level keys: %s", list(raw.keys()))
+    data = raw.get("response", {})
+    log.info("Response keys: %s", list(data.keys()))
+
     assets = data.get("assets", [])
     descriptions = data.get("descriptions", [])
     log.info(
@@ -134,7 +138,7 @@ def _inventory_via_econ_api(steam_id: str) -> list[dict]:
         sample = descriptions[0]
         log.info("Sample description keys: %s", list(sample.keys()))
         log.info(
-            "Sample description: marketable=%s market_hash_name=%s",
+            "Sample: marketable=%s market_hash_name=%s",
             sample.get("marketable"), sample.get("market_hash_name"),
         )
     items = _parse_assets_and_descriptions(assets, descriptions)
