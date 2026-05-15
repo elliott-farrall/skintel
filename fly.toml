@@ -1,24 +1,30 @@
-app = "skintel"
-primary_region = "lhr"
+# fly.toml app configuration file generated for skintel on 2026-05-15T22:51:40Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'skintel'
+primary_region = 'lhr'
 
 [build]
 
 [env]
-  PORT = "8080"
-  SKINTEL_DB = "/data/skintel.db"
+  PORT = '8080'
+  SKINTEL_DB = '/data/skintel.db'
+
+[[mounts]]
+  source = 'skintel_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 1
 
-[[mounts]]
-  source = "skintel_data"
-  destination = "/data"
-
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
+  memory = '256mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
