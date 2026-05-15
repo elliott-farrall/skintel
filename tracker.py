@@ -26,6 +26,15 @@ PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
 
+# Steam blocks datacenter IPs without a browser UA
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript("""
@@ -67,7 +76,17 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 def get_inventory(steam_id: str) -> list[dict]:
     url = INVENTORY_URL.format(steam_id=steam_id)
-    resp = requests.get(url, params={"l": "english", "count": 5000}, timeout=30)
+    resp = requests.get(
+        url,
+        params={"l": "english", "count": 5000},
+        headers=HEADERS,
+        timeout=30,
+    )
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "Steam returned 403 — inventory is private or Steam is blocking the request. "
+            "Ensure your Steam inventory privacy is set to Public."
+        )
     resp.raise_for_status()
     data = resp.json()
 
@@ -97,7 +116,7 @@ def get_inventory(steam_id: str) -> list[dict]:
 def fetch_price(market_hash: str) -> dict | None:
     params = {"appid": APPID, "market_hash_name": market_hash, "currency": 1}
     try:
-        resp = requests.get(PRICE_URL, params=params, timeout=15)
+        resp = requests.get(PRICE_URL, params=params, headers=HEADERS, timeout=15)
         if resp.status_code == 429:
             log.warning("Rate limited fetching %s — skipping", market_hash)
             return None
