@@ -124,7 +124,20 @@ def _inventory_via_econ_api(steam_id: str) -> list[dict]:
     resp.raise_for_status()
 
     data = resp.json().get("response", {})
-    items = _parse_assets_and_descriptions(data.get("assets", []), data.get("descriptions", []))
+    assets = data.get("assets", [])
+    descriptions = data.get("descriptions", [])
+    log.info(
+        "IEconService response: total_inventory_count=%s assets=%d descriptions=%d",
+        data.get("total_inventory_count", "?"), len(assets), len(descriptions),
+    )
+    if descriptions:
+        sample = descriptions[0]
+        log.info("Sample description keys: %s", list(sample.keys()))
+        log.info(
+            "Sample description: marketable=%s market_hash_name=%s",
+            sample.get("marketable"), sample.get("market_hash_name"),
+        )
+    items = _parse_assets_and_descriptions(assets, descriptions)
     log.info("Found %d marketable items via IEconService", len(items))
     return items
 
