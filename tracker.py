@@ -21,7 +21,7 @@ STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")
 
 # Inventory: prefer the official Web API (works from servers); fall back to
 # the community endpoint (works locally but often blocked from datacenters).
-INVENTORY_API_URL = "https://api.steampowered.com/IEconItems_730/GetPlayerItems/v0001/"
+INVENTORY_API_URL = "https://api.steampowered.com/IInventoryService/GetInventory/v1/"
 INVENTORY_COMMUNITY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
 PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
@@ -84,31 +84,34 @@ def get_inventory(steam_id: str) -> list[dict]:
 
 
 def _inventory_via_api(steam_id: str) -> list[dict]:
-    """Use the official Steam Web API — reliable from server IPs, requires API key."""
+    """Use IInventoryService/GetInventory/v1 — current supported server-side API."""
     resp = requests.get(
         INVENTORY_API_URL,
-        params={"key": STEAM_API_KEY, "steamid": steam_id, "l": "english"},
+        params={"key": STEAM_API_KEY, "steamid": steam_id, "appid": APPID, "get_descriptions": 1},
         timeout=30,
     )
     if resp.status_code == 403:
-        raise RuntimeError("Steam API returned 403 — check your STEAM_API_KEY and inventory privacy.")
+        raise RuntimeError("Steam API returned 403 — check STEAM_API_KEY and inventory privacy.")
     resp.raise_for_status()
-    data = resp.json()
+    data = resp.json().get("response", {})
 
-    result = data.get("result", {})
-    if result.get("status") != 1:
-        raise RuntimeError(f"Steam API inventory error: {result.get('statusDetail', data)}")
+    assets = {a["assetid"]: a for a in data.get("assets", [])}
+    descriptions = {
+        (d["classid"], d["instanceid"]): d for d in data.get("descriptions", [])
+    }
 
     items = []
-    for item in result.get("items", []):
-        if not item.get("marketable"):
+    for asset in assets.values():
+        key = (asset["classid"], asset["instanceid"])
+        desc = descriptions.get(key, {})
+        if not desc.get("marketable"):
             continue
         items.append({
-            "market_hash": item["market_hash_name"],
-            "name": item.get("name", item["market_hash_name"]),
+            "market_hash": desc["market_hash_name"],
+            "name": desc.get("name", desc["market_hash_name"]),
         })
 
-    log.info("Found %d marketable items via Steam Web API", len(items))
+    log.info("Found %d marketable items via IInventoryService", len(items))
     return items
 
 
