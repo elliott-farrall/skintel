@@ -17,8 +17,12 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
 STEAM_ID = os.getenv("STEAM_ID", "")
+STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")
 
-INVENTORY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
+# Inventory: prefer the official Web API (works from servers); fall back to
+# the community endpoint (works locally but often blocked from datacenters).
+INVENTORY_API_URL = "https://api.steampowered.com/IEconItems_730/GetPlayerItems/v0001/"
+INVENTORY_COMMUNITY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
 PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
 
@@ -26,7 +30,6 @@ PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
 
-# Steam blocks datacenter IPs without a browser UA
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -75,17 +78,53 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str) -> list[dict]:
-    url = INVENTORY_URL.format(steam_id=steam_id)
+    if STEAM_API_KEY:
+        return _inventory_via_api(steam_id)
+    return _inventory_via_community(steam_id)
+
+
+def _inventory_via_api(steam_id: str) -> list[dict]:
+    """Use the official Steam Web API — reliable from server IPs, requires API key."""
+    resp = requests.get(
+        INVENTORY_API_URL,
+        params={"key": STEAM_API_KEY, "steamid": steam_id, "l": "english"},
+        timeout=30,
+    )
+    if resp.status_code == 403:
+        raise RuntimeError("Steam API returned 403 — check your STEAM_API_KEY and inventory privacy.")
+    resp.raise_for_status()
+    data = resp.json()
+
+    result = data.get("result", {})
+    if result.get("status") != 1:
+        raise RuntimeError(f"Steam API inventory error: {result.get('statusDetail', data)}")
+
+    items = []
+    for item in result.get("items", []):
+        if not item.get("marketable"):
+            continue
+        items.append({
+            "market_hash": item["market_hash_name"],
+            "name": item.get("name", item["market_hash_name"]),
+        })
+
+    log.info("Found %d marketable items via Steam Web API", len(items))
+    return items
+
+
+def _inventory_via_community(steam_id: str) -> list[dict]:
+    """Fall back to the community endpoint — works locally, often blocked from datacenters."""
+    url = INVENTORY_COMMUNITY_URL.format(steam_id=steam_id)
     resp = requests.get(
         url,
         params={"l": "english", "count": 5000},
         headers=HEADERS,
         timeout=30,
     )
-    if resp.status_code == 403:
+    if resp.status_code in (400, 403):
         raise RuntimeError(
-            "Steam returned 403 — inventory is private or Steam is blocking the request. "
-            "Ensure your Steam inventory privacy is set to Public."
+            f"Steam community inventory returned {resp.status_code}. "
+            "Set STEAM_API_KEY to use the official API instead, or check inventory privacy."
         )
     resp.raise_for_status()
     data = resp.json()
@@ -109,7 +148,7 @@ def get_inventory(steam_id: str) -> list[dict]:
             "name": desc.get("name", desc["market_hash_name"]),
         })
 
-    log.info("Found %d marketable items in inventory", len(items))
+    log.info("Found %d marketable items via community endpoint", len(items))
     return items
 
 
