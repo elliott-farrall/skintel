@@ -17,15 +17,12 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
 STEAM_ID = os.getenv("STEAM_ID", "")
-STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
 
-# Server-side inventory: works from datacenter IPs with a Web API key
-INVENTORY_API_URL = "https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/"
-# Community endpoint: fine locally, blocked from datacenter IPs by Steam
 INVENTORY_COMMUNITY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
+SCRAPERAPI_URL = "https://api.scraperapi.com/"
 PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
-CONTEXT_ID = 2  # CS2 inventory context
 
 PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
@@ -82,8 +79,8 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str) -> list[dict]:
-    if STEAM_API_KEY:
-        return _inventory_via_econ_api(steam_id)
+    if SCRAPERAPI_KEY:
+        return _inventory_via_scraper(steam_id)
     return _inventory_via_community(steam_id)
 
 
@@ -101,53 +98,35 @@ def _parse_assets_and_descriptions(assets: list, descriptions: list) -> list[dic
     return items
 
 
-def _inventory_via_econ_api(steam_id: str) -> list[dict]:
-    """IEconService/GetInventoryItemsWithDescriptions — designed for server-side use."""
-    resp = requests.get(
-        INVENTORY_API_URL,
-        params={
-            "key": STEAM_API_KEY,
-            "steamid": steam_id,
-            "appid": APPID,
-            "contextid": CONTEXT_ID,
-            "get_descriptions": 1,
-            "language": "english",
-            "count": 5000,
-        },
-        timeout=30,
+def _inventory_via_scraper(steam_id: str) -> list[dict]:
+    """Route Steam community inventory through ScraperAPI to bypass datacenter IP blocks."""
+    target = (
+        f"https://steamcommunity.com/inventory/{steam_id}/730/2"
+        "?l=english&count=5000"
     )
-    log.info("Inventory API: HTTP %d", resp.status_code)
-    if resp.status_code == 403:
+    resp = requests.get(
+        SCRAPERAPI_URL,
+        params={"api_key": SCRAPERAPI_KEY, "url": target},
+        timeout=60,  # ScraperAPI can take longer than a direct request
+    )
+    log.info("Inventory via ScraperAPI: HTTP %d", resp.status_code)
+    if resp.status_code in (400, 403):
         raise RuntimeError(
-            "Steam API 403 — check STEAM_API_KEY is valid and inventory privacy is Public."
+            f"ScraperAPI inventory returned {resp.status_code} — "
+            "check SCRAPERAPI_KEY and Steam inventory privacy settings."
         )
     resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise RuntimeError(f"Inventory response not successful: {data}")
 
-    raw = resp.json()
-    log.info("Raw response top-level keys: %s", list(raw.keys()))
-    data = raw.get("response", {})
-    log.info("Response keys: %s", list(data.keys()))
-
-    assets = data.get("assets", [])
-    descriptions = data.get("descriptions", [])
-    log.info(
-        "IEconService response: total_inventory_count=%s assets=%d descriptions=%d",
-        data.get("total_inventory_count", "?"), len(assets), len(descriptions),
-    )
-    if descriptions:
-        sample = descriptions[0]
-        log.info("Sample description keys: %s", list(sample.keys()))
-        log.info(
-            "Sample: marketable=%s market_hash_name=%s",
-            sample.get("marketable"), sample.get("market_hash_name"),
-        )
-    items = _parse_assets_and_descriptions(assets, descriptions)
-    log.info("Found %d marketable items via IEconService", len(items))
+    items = _parse_assets_and_descriptions(data.get("assets", []), data.get("descriptions", []))
+    log.info("Found %d marketable items via ScraperAPI", len(items))
     return items
 
 
 def _inventory_via_community(steam_id: str) -> list[dict]:
-    """Community endpoint — fine locally, blocked from datacenter IPs."""
+    """Direct community endpoint — works locally, blocked from datacenter IPs."""
     url = INVENTORY_COMMUNITY_URL.format(steam_id=steam_id)
     resp = requests.get(
         url,
@@ -159,7 +138,7 @@ def _inventory_via_community(steam_id: str) -> list[dict]:
     if resp.status_code in (400, 403):
         raise RuntimeError(
             f"Steam community inventory returned {resp.status_code}. "
-            "Set STEAM_API_KEY to use the Web API when running on a server."
+            "Set SCRAPERAPI_KEY to proxy requests when running on a server."
         )
     resp.raise_for_status()
     data = resp.json()
