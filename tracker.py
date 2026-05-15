@@ -17,25 +17,25 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
 STEAM_ID = os.getenv("STEAM_ID", "")
-STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")
 
-# Inventory: prefer the official Web API (works from servers); fall back to
-# the community endpoint (works locally but often blocked from datacenters).
-INVENTORY_API_URL = "https://api.steampowered.com/IInventoryService/GetInventory/v1/"
-INVENTORY_COMMUNITY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
+INVENTORY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
 PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
 
 PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
+INVENTORY_RETRIES = 3
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://steamcommunity.com/",
 }
 
 
@@ -78,81 +78,63 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str) -> list[dict]:
-    if STEAM_API_KEY:
-        return _inventory_via_api(steam_id)
-    return _inventory_via_community(steam_id)
+    url = INVENTORY_URL.format(steam_id=steam_id)
+    last_exc: Exception | None = None
 
+    for attempt in range(1, INVENTORY_RETRIES + 1):
+        try:
+            resp = requests.get(
+                url,
+                params={"l": "english", "count": 5000},
+                headers=HEADERS,
+                timeout=30,
+            )
+            log.info("Inventory attempt %d: HTTP %d", attempt, resp.status_code)
 
-def _inventory_via_api(steam_id: str) -> list[dict]:
-    """Use IInventoryService/GetInventory/v1 — current supported server-side API."""
-    resp = requests.get(
-        INVENTORY_API_URL,
-        params={"key": STEAM_API_KEY, "steamid": steam_id, "appid": APPID, "get_descriptions": 1},
-        timeout=30,
-    )
-    if resp.status_code == 403:
-        raise RuntimeError("Steam API returned 403 — check STEAM_API_KEY and inventory privacy.")
-    resp.raise_for_status()
-    data = resp.json().get("response", {})
+            if resp.status_code == 403:
+                raise RuntimeError(
+                    "Steam returned 403 — set your Steam inventory privacy to Public: "
+                    "Steam → Profile → Edit Profile → Privacy Settings → Inventory: Public"
+                )
+            if resp.status_code == 400:
+                log.warning("Got 400 on attempt %d, retrying in %ds...", attempt, attempt * 5)
+                time.sleep(attempt * 5)
+                continue
 
-    assets = {a["assetid"]: a for a in data.get("assets", [])}
-    descriptions = {
-        (d["classid"], d["instanceid"]): d for d in data.get("descriptions", [])
-    }
+            resp.raise_for_status()
+            data = resp.json()
 
-    items = []
-    for asset in assets.values():
-        key = (asset["classid"], asset["instanceid"])
-        desc = descriptions.get(key, {})
-        if not desc.get("marketable"):
-            continue
-        items.append({
-            "market_hash": desc["market_hash_name"],
-            "name": desc.get("name", desc["market_hash_name"]),
-        })
+            if not data.get("success"):
+                raise RuntimeError(f"Inventory response not successful: {data}")
 
-    log.info("Found %d marketable items via IInventoryService", len(items))
-    return items
+            assets = {a["assetid"]: a for a in data.get("assets", [])}
+            descriptions = {
+                (d["classid"], d["instanceid"]): d for d in data.get("descriptions", [])
+            }
 
+            items = []
+            for asset in assets.values():
+                key = (asset["classid"], asset["instanceid"])
+                desc = descriptions.get(key, {})
+                if not desc.get("marketable"):
+                    continue
+                items.append({
+                    "market_hash": desc["market_hash_name"],
+                    "name": desc.get("name", desc["market_hash_name"]),
+                })
 
-def _inventory_via_community(steam_id: str) -> list[dict]:
-    """Fall back to the community endpoint — works locally, often blocked from datacenters."""
-    url = INVENTORY_COMMUNITY_URL.format(steam_id=steam_id)
-    resp = requests.get(
-        url,
-        params={"l": "english", "count": 5000},
-        headers=HEADERS,
-        timeout=30,
-    )
-    if resp.status_code in (400, 403):
-        raise RuntimeError(
-            f"Steam community inventory returned {resp.status_code}. "
-            "Set STEAM_API_KEY to use the official API instead, or check inventory privacy."
-        )
-    resp.raise_for_status()
-    data = resp.json()
+            log.info("Found %d marketable items in inventory", len(items))
+            return items
 
-    if not data.get("success"):
-        raise RuntimeError(f"Inventory fetch failed: {data}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Inventory attempt %d failed: %s", attempt, exc)
+            if attempt < INVENTORY_RETRIES:
+                time.sleep(attempt * 5)
 
-    assets = {a["assetid"]: a for a in data.get("assets", [])}
-    descriptions = {
-        (d["classid"], d["instanceid"]): d for d in data.get("descriptions", [])
-    }
-
-    items = []
-    for asset in assets.values():
-        key = (asset["classid"], asset["instanceid"])
-        desc = descriptions.get(key, {})
-        if not desc.get("marketable"):
-            continue
-        items.append({
-            "market_hash": desc["market_hash_name"],
-            "name": desc.get("name", desc["market_hash_name"]),
-        })
-
-    log.info("Found %d marketable items via community endpoint", len(items))
-    return items
+    raise RuntimeError(f"Inventory fetch failed after {INVENTORY_RETRIES} attempts: {last_exc}")
 
 
 def fetch_price(market_hash: str) -> dict | None:
