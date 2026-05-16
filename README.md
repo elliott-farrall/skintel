@@ -37,6 +37,21 @@ Separately, on demand:
 
 The dashboard auto-refreshes every 5 minutes via `setInterval`, but that only re-renders from the DB — it does not trigger a new inventory fetch.
 
+## Dashboard
+
+Cards are ordered with AI sell-signal alerts first, then by recent momentum (largest recent rise on top), then by price.
+
+Each card may show one or more badges, computed from the last ~30 stored price points:
+
+| Badge       | Meaning                                                            | Source |
+| ----------- | ------------------------------------------------------------------ | ------ |
+| **Sell**    | Claude has flagged this as a peak — also sent as a Discord DM      | AI     |
+| **ATH**     | Current price is within 3% of its all-time high in stored history  | static |
+| **↑ X%**    | Avg of last 5 prices is ≥10% higher than the prior history         | static |
+| **↓ X%**    | Avg of last 5 prices is ≥10% lower than the prior history          | static |
+
+Static badges update every collect cycle; they don't fire Discord notifications.
+
 ## Data model
 
 ```

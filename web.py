@@ -44,6 +44,30 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def _compute_stats(history: list[dict], current: float | None) -> dict:
+    """Static signals derived from the 30-point history (oldest → newest)."""
+    prices = [h["median_price"] for h in history if h["median_price"] is not None]
+    if current is None or len(prices) < 5:
+        return {}
+
+    ath = max(prices)
+    avg_all = sum(prices) / len(prices)
+
+    recent_n = min(5, len(prices) // 2)
+    recent = prices[-recent_n:]
+    older = prices[:-recent_n] or recent
+    avg_recent = sum(recent) / len(recent)
+    avg_older = sum(older) / len(older)
+
+    return {
+        "ath": ath,
+        "pct_vs_ath": (current - ath) / ath * 100,
+        "pct_vs_avg": (current - avg_all) / avg_all * 100,
+        "recent_change_pct": (avg_recent - avg_older) / avg_older * 100 if avg_older else 0.0,
+        "at_ath": current >= ath * 0.97,
+    }
+
+
 def run_collect() -> None:
     if not _run_lock.acquire(blocking=False):
         log.info("Collect already running — skipping")
@@ -143,6 +167,8 @@ def api_skins():
     result = []
     for s in skins:
         sid = s["id"]
+        history = history_by_skin.get(sid, [])
+        stats = _compute_stats(history, s["median_price"])
         result.append({
             "id": sid,
             "market_hash": s["market_hash"],
@@ -153,10 +179,16 @@ def api_skins():
             "volume": s["volume"],
             "fetched_at": s["fetched_at"],
             "alerts": alerts_by_skin.get(sid, []),
-            "history": history_by_skin.get(sid, []),
+            "history": history,
+            "stats": stats,
         })
 
-    result.sort(key=lambda x: (-len(x["alerts"]), -(x["median_price"] or 0)))
+    # Order: AI sell-signal alerts first, then by recent momentum desc, then price desc
+    result.sort(key=lambda x: (
+        0 if x["alerts"] else 1,
+        -(x["stats"].get("recent_change_pct", 0) or 0),
+        -(x["median_price"] or 0),
+    ))
     return jsonify(result)
 
 
