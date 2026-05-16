@@ -265,10 +265,7 @@ async function load() {
 
   for (const skin of skins) {
     grid.appendChild(buildCard(skin));
-  }
-
-  for (const skin of skins) {
-    loadChart(skin.id);
+    renderChart(skin);
   }
 }
 
@@ -321,16 +318,11 @@ function buildCard(skin) {
   return card;
 }
 
-async function loadChart(skinId) {
-  let data;
-  try {
-    const res = await fetch(`/api/skins/${skinId}/history`);
-    if (!res.ok) return;
-    data = await res.json();
-  } catch { return; }
-  if (data.length < 2) return;
+function renderChart(skin) {
+  const data = skin.history;
+  if (!data || data.length < 2) return;
 
-  const canvas = document.getElementById(`chart-${skinId}`);
+  const canvas = document.getElementById(`chart-${skin.id}`);
   if (!canvas) return;
 
   const prices = data.map(d => d.median_price);
