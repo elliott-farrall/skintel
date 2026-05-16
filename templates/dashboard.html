@@ -355,8 +355,11 @@ async function triggerRun() {
   try {
     const res = await fetch("/api/run", { method: "POST" });
     const data = await res.json();
-    if (data.status === "dispatched") {
-      btn.textContent = "Queued ✓";
+    if (data.status === "started") {
+      btn.textContent = "Running…";
+      setTimeout(load, 15000);
+    } else if (data.status === "already_running") {
+      btn.textContent = "Already running";
     } else {
       btn.textContent = data.error || "Error";
     }
@@ -364,7 +367,7 @@ async function triggerRun() {
     btn.textContent = "Error";
   }
 
-  setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 8000);
+  setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 20000);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

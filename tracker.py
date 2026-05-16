@@ -74,53 +74,50 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str, api_key: str) -> list[dict]:
-    url = "https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/"
-    items = []
+    """Fetch CS2 inventory with embedded prices from steamwebapi.com."""
+    url = "https://api.steamwebapi.com/steam/api/inventory"
+    resp = requests.get(
+        url,
+        params={"key": api_key, "steam_id": steam_id, "game": "csgo", "parse": 1},
+        timeout=30,
+    )
+    log.info("Inventory: HTTP %d", resp.status_code)
+    resp.raise_for_status()
+    raw = resp.json()
+
+    # Response is either a list of items or {"items": [...]}
+    entries = raw if isinstance(raw, list) else raw.get("items", raw.get("data", []))
+    if entries and not isinstance(entries, list):
+        log.warning("Unexpected response shape: %s", list(raw.keys()) if isinstance(raw, dict) else type(raw))
+        return []
+
+    if entries:
+        log.info("Sample item keys: %s", list(entries[0].keys()))
+
     seen: set[str] = set()
-    start_assetid = None
+    items = []
+    for entry in entries:
+        if not entry.get("marketable", 1):
+            continue
+        mh = entry.get("market_hash_name") or entry.get("markethashname")
+        if not mh or mh in seen:
+            continue
+        seen.add(mh)
 
-    while True:
-        params = {
-            "key": api_key,
-            "steamid": steam_id,
-            "appid": APPID,
-            "contextid": 2,
-            "count": 5000,
-            "language": "english",
+        def _price(val: str | float | None) -> float | None:
+            if val is None:
+                return None
+            try:
+                return float(str(val).replace("$", "").replace(",", "").strip())
+            except (ValueError, AttributeError):
+                return None
+
+        price = {
+            "lowest_price":  _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
+            "median_price":  _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
+            "volume":        entry.get("volume") or entry.get("pricesold"),
         }
-        if start_assetid:
-            params["start_assetid"] = start_assetid
-
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
-        log.info("Inventory page: HTTP %d", resp.status_code)
-        resp.raise_for_status()
-        data = resp.json().get("response", {})
-
-        assets = data.get("assets", [])
-        descriptions = data.get("descriptions", [])
-        log.info("assets=%d descriptions=%d total_inventory_count=%s",
-                 len(assets), len(descriptions), data.get("total_inventory_count"))
-        if descriptions:
-            sample = descriptions[0]
-            log.info("sample desc keys=%s marketable=%r", list(sample.keys()), sample.get("marketable"))
-
-        desc_map = {
-            (d["classid"], d["instanceid"]): d
-            for d in descriptions
-        }
-        for asset in assets:
-            desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
-            if not desc.get("marketable"):
-                continue
-            mh = desc["market_hash_name"]
-            if mh not in seen:
-                seen.add(mh)
-                items.append({"market_hash": mh, "name": desc.get("name", mh)})
-
-        if data.get("more_items"):
-            start_assetid = data.get("last_assetid")
-        else:
-            break
+        items.append({"market_hash": mh, "name": entry.get("name", mh), "price": price})
 
     log.info("Found %d unique marketable items", len(items))
     return items
@@ -264,10 +261,17 @@ def check_volume_surge(
     return True
 
 
-def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
-    """Store prices and run detection. Used by /api/ingest and local runs."""
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+def ingest(
+    items: list[dict],
+    threshold_pct: float,
+    rolling_days: int,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Store prices and run detection."""
+    close_after = conn is None
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        init_db(conn)
 
     stored = 0
     alert_count = 0
@@ -292,7 +296,8 @@ def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
             if check_volume_surge(conn, skin_id, mh, price["volume"], rolling_days):
                 alert_count += 1
 
-    conn.close()
+    if close_after:
+        conn.close()
     log.info("Ingest complete. %d stored, %d alert(s).", stored, alert_count)
     return {"stored": stored, "alerts": alert_count}
 
@@ -313,19 +318,14 @@ def collect(
 
     payload_items = []
     for i, item in enumerate(items):
-        price = fetch_price(item["market_hash"])
-        if price:
+        price = item.get("price") or {}
+        if price.get("median_price") is not None or price.get("lowest_price") is not None:
             payload_items.append({"market_hash": item["market_hash"], "price": price})
-            log.info(
-                "[%d/%d] %s  median=$%s  vol=%s",
-                i + 1, len(items), item["market_hash"],
-                price["median_price"], price["volume"],
-            )
+            log.info("[%d/%d] %s  median=$%s  vol=%s",
+                     i + 1, len(items), item["market_hash"],
+                     price.get("median_price"), price.get("volume"))
         else:
             log.info("[%d/%d] %s — no price", i + 1, len(items), item["market_hash"])
-
-        if i < len(items) - 1:
-            time.sleep(PRICE_FETCH_DELAY)
 
     payload = {
         "items": payload_items,
@@ -399,7 +399,7 @@ def main() -> None:
 
     collect_p = sub.add_parser("collect", help="Fetch inventory+prices and POST to ingest URL")
     collect_p.add_argument("--steam-id", required=True)
-    collect_p.add_argument("--api-key", required=True, help="Steam Web API key")
+    collect_p.add_argument("--api-key", required=True, help="steamwebapi.com API key")
     collect_p.add_argument("--push-url", required=True, help="URL of /api/ingest on Fly.io")
     collect_p.add_argument("--push-token", required=True, help="INGEST_TOKEN secret")
     collect_p.add_argument("--threshold", type=float, default=20.0)
