@@ -55,7 +55,6 @@
     .btn:disabled { opacity: 0.5; cursor: default; }
     .btn:not(:disabled):hover { opacity: 0.8; }
     .btn-run      { background: #4ade80; color: #000; }
-    .btn-backfill { background: #1e3a4a; color: #7ec8e3; border: 1px solid #2a5068; }
     .btn-steam {
       background: transparent;
       color: #7ec8e3;
@@ -212,7 +211,6 @@
   <h1>Skintel</h1>
   <div id="meta">Loading…</div>
   <button class="btn btn-run" id="run-btn" onclick="triggerRun()">Run Now</button>
-  <button class="btn btn-backfill" id="backfill-btn" onclick="triggerBackfill()">Backfill History</button>
 </header>
 
 <div id="alert-bar"></div>
@@ -226,11 +224,12 @@ const STEAM_ID = {{ steam_id | tojson }};
 async function load() {
   let skins;
   try {
-    const res = await fetch("/api/skins");
+    const res = await fetch("/api/skins", { signal: AbortSignal.timeout(30000) });
     if (!res.ok) throw new Error(res.status);
     skins = await res.json();
   } catch (e) {
-    document.getElementById("loading").textContent = "Failed to load data.";
+    document.getElementById("loading").textContent =
+      e.name === "TimeoutError" ? "Request timed out — try refreshing." : "Failed to load data.";
     return;
   }
 
@@ -408,22 +407,6 @@ async function triggerRun() {
   setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 20000);
 }
 
-async function triggerBackfill() {
-  const btn = document.getElementById("backfill-btn");
-  btn.disabled = true;
-  btn.textContent = "Backfilling…";
-
-  try {
-    const res = await fetch("/api/backfill", { method: "POST" });
-    const data = await res.json();
-    btn.textContent = data.status === "started" ? "Running…" : (data.status === "already_running" ? "Already running" : "Error");
-    if (data.status === "started") setTimeout(load, 30000);
-  } catch {
-    btn.textContent = "Error";
-  }
-
-  setTimeout(() => { btn.disabled = false; btn.textContent = "Backfill History"; }, 60000);
-}
 
 function esc(s) {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
