@@ -24,6 +24,7 @@ DISCORD_USER_ID      = os.getenv("DISCORD_USER_ID", "")
 STEAM_SESSION_COOKIE = os.getenv("STEAM_SESSION_COOKIE", "")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL         = os.getenv("SKINTEL_CLAUDE_MODEL", "claude-haiku-4-5")
+MIN_SELL_PRICE       = float(os.getenv("MIN_SELL_PRICE", "1.00"))  # GBP — skip cheaper skins entirely
 
 APPID = 730
 
@@ -378,48 +379,70 @@ def check_sell_signal(
     market_hash: str,
     current_price: float,
 ) -> bool:
-    """Use Claude to analyse price history and decide if now is a good time to sell."""
+    """Use Claude to detect if a skin has risen significantly and is near its peak."""
     if not ANTHROPIC_API_KEY or current_price is None:
+        return False
+
+    # Skip cheap skins — not worth the noise or API call
+    if current_price < MIN_SELL_PRICE:
         return False
 
     rows = conn.execute(
         """SELECT fetched_at, median_price, volume FROM prices
            WHERE skin_id = ? AND median_price IS NOT NULL
-           ORDER BY fetched_at DESC LIMIT 30""",
+           ORDER BY fetched_at DESC LIMIT 60""",
         (skin_id,),
     ).fetchall()
 
-    if len(rows) < 5:
+    if len(rows) < 7:
         return False
+
+    prices = [r[1] for r in rows]   # newest first
+
+    avg_all    = sum(prices) / len(prices)
+    avg_recent = sum(prices[:5]) / 5
+    avg_older  = sum(prices[5:]) / (len(prices) - 5)
+    ath        = max(prices)
+    pct_vs_avg = (current_price - avg_all) / avg_all * 100
+    pct_vs_ath = (current_price - ath) / ath * 100           # negative means below ATH
+    trend_pct  = (avg_recent - avg_older) / avg_older * 100  # positive = rising recently
 
     history_lines = "\n".join(
         f"{r[0][:10]}: £{r[1]:.2f}" + (f" (vol {r[2]})" if r[2] else "")
         for r in reversed(rows)
     )
 
+    context = (
+        f"Skin: {market_hash}\n"
+        f"Current price: £{current_price:.2f}\n"
+        f"Historical average ({len(rows)} data points): £{avg_all:.2f} "
+        f"(current is {pct_vs_avg:+.1f}% vs average)\n"
+        f"All-time high in history: £{ath:.2f} "
+        f"(current is {pct_vs_ath:+.1f}% vs ATH)\n"
+        f"Recent trend: avg of last 5 = £{avg_recent:.2f} vs prior avg = £{avg_older:.2f} "
+        f"({trend_pct:+.1f}%)\n\n"
+        f"Price history (oldest → newest):\n{history_lines}"
+    )
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=256,
+            max_tokens=200,
             system=(
-                "You are a CS2 skin market analyst helping a player decide when to sell. "
-                "The player wants to sell at or near price peaks and avoid selling during dips. "
-                "Analyse the price history trend and current price. "
-                "Recommend selling if the price is near a recent high, has risen significantly from its average, "
-                "or shows signs of reversing after a rise. "
-                "Recommend holding if the price is stable, near a recent low, or still in an uptrend. "
-                "Reply ONLY with valid JSON in this exact format: "
-                '{\"recommend_sell\": true, \"reason\": \"one sentence explanation\"}'
+                "You are a CS2 skin market analyst. Your job is to identify the optimal moment to sell: "
+                "when a skin has risen substantially from its baseline price and appears to be at or near a peak.\n\n"
+                "Recommend SELL only if:\n"
+                "- The current price is notably above its historical average (a real rise, not noise)\n"
+                "- The price appears to be levelling off or showing early signs of a reversal after rising\n"
+                "- Selling now captures most of the gain before a likely pullback\n\n"
+                "Recommend HOLD if:\n"
+                "- The price is still actively climbing — don't sell too early\n"
+                "- The price is near its average or recent lows — the rise hasn't happened yet\n"
+                "- The movement looks like normal daily noise rather than a meaningful spike\n\n"
+                'Reply ONLY with JSON: {"recommend_sell": true, "reason": "one concise sentence"}'
             ),
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Skin: {market_hash}\n"
-                    f"Current price: £{current_price:.2f}\n\n"
-                    f"Price history (oldest to newest):\n{history_lines}"
-                ),
-            }],
+            messages=[{"role": "user", "content": context}],
         )
         text = resp.content[0].text.strip()
         start = text.find("{")
@@ -432,8 +455,9 @@ def check_sell_signal(
         return False
 
     if recommend_sell:
-        log.info("SELL SIGNAL  %s  £%.2f  reason=%s", market_hash, current_price, reason)
-        _insert_alert(conn, skin_id, "sell_signal", current_price, None, None, reason=reason)
+        log.info("SELL SIGNAL  %s  £%.2f (+%.1f%% vs avg)  reason=%s",
+                 market_hash, current_price, pct_vs_avg, reason)
+        _insert_alert(conn, skin_id, "sell_signal", current_price, avg_all, pct_vs_avg, reason=reason)
     return recommend_sell
 
 
