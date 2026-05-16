@@ -19,11 +19,11 @@ jobs:
 
       - run: python tracker.py collect
           --steam-id "$STEAM_ID"
-          --api-key "$STEAM_API_KEY"
+          --api-key "$STEAMWEBAPI_KEY"
           --push-url "$FLY_INGEST_URL"
           --push-token "$INGEST_TOKEN"
         env:
-          STEAM_ID:       ${{ secrets.STEAM_ID }}
-          STEAM_API_KEY:  ${{ secrets.STEAM_API_KEY }}
-          FLY_INGEST_URL: ${{ secrets.FLY_INGEST_URL }}
-          INGEST_TOKEN:   ${{ secrets.INGEST_TOKEN }}
+          STEAM_ID:        ${{ secrets.STEAM_ID }}
+          STEAMWEBAPI_KEY: ${{ secrets.STEAMWEBAPI_KEY }}
+          FLY_INGEST_URL:  ${{ secrets.FLY_INGEST_URL }}
+          INGEST_TOKEN:    ${{ secrets.INGEST_TOKEN }}
