@@ -76,7 +76,7 @@ def run_backfill() -> None:
     try:
         conn = sqlite3.connect(tr.DB_PATH)
         tr.init_db(conn)
-        result = tr.backfill_history(conn, STEAMWEBAPI_KEY)
+        result = tr.backfill_history(conn)
         conn.close()
         log.info("Backfill complete: %s", result)
     except Exception:
