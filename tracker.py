@@ -1,6 +1,8 @@
 """CS2 skin price tracker — core library."""
 
 import os
+import re
+import time
 import sqlite3
 import logging
 import argparse
@@ -16,10 +18,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 APPID = 730
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
+
+ALERT_COLORS = {
+    "spike":        0xC084FC,  # purple
+    "all_time_high": 0xF87171, # red
+    "volume_surge": 0xFB923C,  # orange
+}
+ALERT_LABELS = {
+    "spike":        "Price Spike",
+    "all_time_high": "All-Time High",
+    "volume_surge": "Volume Surge",
+}
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -120,6 +134,86 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
     return items
 
 
+def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
+    """Fetch up to 365 days of price history for one item."""
+    url = "https://api.steamwebapi.com/steam/api/pricehistory"
+    resp = requests.get(
+        url,
+        params={"key": api_key, "market_hash_name": market_hash, "appid": APPID},
+        timeout=30,
+    )
+    if resp.status_code == 429:
+        log.warning("Rate limited on history for %s", market_hash)
+        return []
+    resp.raise_for_status()
+    data = resp.json()
+
+    raw_prices = data if isinstance(data, list) else data.get("prices", [])
+    if not raw_prices:
+        return []
+
+    rows = []
+    for entry in raw_prices:
+        try:
+            date_str, price_val, vol_str = entry[0], entry[1], entry[2]
+            # "Nov 27 2013 01:+0" → parse just the date portion
+            m = re.match(r"(\w+ \d+ \d+)", str(date_str))
+            if not m:
+                continue
+            dt = datetime.strptime(m.group(1), "%b %d %Y").replace(
+                hour=12, tzinfo=timezone.utc
+            )
+            rows.append({
+                "fetched_at": dt.isoformat(),
+                "median_price": float(price_val) if price_val else None,
+                "lowest_price": None,
+                "volume": int(vol_str) if vol_str else None,
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def backfill_history(conn: sqlite3.Connection, api_key: str) -> dict:
+    """Fetch historical prices for all tracked skins and insert missing rows."""
+    skins = conn.execute("SELECT id, market_hash FROM skins").fetchall()
+    total_inserted = 0
+
+    for skin_id, market_hash in skins:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM prices WHERE skin_id = ?", (skin_id,)
+        ).fetchone()[0]
+
+        if existing >= 30:
+            log.info("Skipping backfill for %s — already has %d rows", market_hash, existing)
+            continue
+
+        log.info("Backfilling %s", market_hash)
+        try:
+            rows = fetch_price_history(market_hash, api_key)
+        except Exception as exc:
+            log.warning("History fetch failed for %s: %s", market_hash, exc)
+            rows = []
+
+        inserted = 0
+        for row in rows:
+            try:
+                conn.execute(
+                    """INSERT INTO prices (skin_id, fetched_at, lowest_price, median_price, volume)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (skin_id, row["fetched_at"], row["lowest_price"], row["median_price"], row["volume"]),
+                )
+                inserted += 1
+            except Exception:
+                continue
+        conn.commit()
+        total_inserted += inserted
+        log.info("  inserted %d rows for %s", inserted, market_hash)
+        time.sleep(0.5)
+
+    return {"skins": len(skins), "inserted": total_inserted}
+
+
 def upsert_skin(conn: sqlite3.Connection, market_hash: str, image_url: str | None = None) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -157,6 +251,47 @@ def rolling_average(conn: sqlite3.Connection, skin_id: int, days: int) -> float 
     return row[0] if row else None
 
 
+def _send_discord_alert(
+    market_hash: str,
+    alert_type: str,
+    current: float,
+    reference: float | None,
+    pct_above: float | None,
+    image_url: str | None = None,
+) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    label = ALERT_LABELS.get(alert_type, alert_type.replace("_", " ").title())
+    color = ALERT_COLORS.get(alert_type, 0x4ADE80)
+
+    fields = [{"name": "Current price", "value": f"${current:.2f}", "inline": True}]
+    if reference is not None:
+        fields.append({"name": "Reference", "value": f"${reference:.2f}", "inline": True})
+    if pct_above is not None:
+        sign = "+" if pct_above >= 0 else ""
+        fields.append({"name": "Change", "value": f"{sign}{pct_above:.1f}%", "inline": True})
+
+    embed: dict = {
+        "title": f"{label}: {market_hash}",
+        "color": color,
+        "fields": fields,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    try:
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code not in (200, 204):
+            log.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        log.warning("Discord webhook failed: %s", exc)
+
+
 def _insert_alert(
     conn: sqlite3.Connection,
     skin_id: int,
@@ -172,6 +307,10 @@ def _insert_alert(
         (skin_id, now, alert_type, current, reference, pct_above),
     )
     conn.commit()
+
+    row = conn.execute("SELECT market_hash, image_url FROM skins WHERE id = ?", (skin_id,)).fetchone()
+    if row:
+        _send_discord_alert(row[0], alert_type, current, reference, pct_above, row[1])
 
 
 def check_spike(
