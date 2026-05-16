@@ -67,6 +67,14 @@ def _get_gbp_rate() -> float:
         return _gbp_rate if _gbp_rate else 0.79
 
 
+def connect(path: str | None = None) -> sqlite3.Connection:
+    """Open a SQLite connection with WAL + busy_timeout for safe concurrent access."""
+    conn = sqlite3.connect(path or DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS skins (
@@ -98,6 +106,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE alerts ADD COLUMN reference REAL",
         "ALTER TABLE skins ADD COLUMN image_url TEXT",
         "ALTER TABLE alerts ADD COLUMN reason TEXT",
+        "ALTER TABLE skins ADD COLUMN rarity_color TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -158,11 +167,21 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
             or entry.get("image_url")
             or entry.get("icon")
         )
+        rarity_color = (
+            entry.get("color")
+            or entry.get("rarity_color")
+            or entry.get("raritycolor")
+            or entry.get("qualitycolor")
+        )
+        if rarity_color:
+            rarity_color = str(rarity_color).lstrip("#").lower()
+
         items.append({
             "market_hash": mh,
             "name": entry.get("name", mh),
             "price": price,
             "image_url": image_url,
+            "rarity_color": rarity_color,
         })
 
     log.info("Found %d unique marketable items", len(items))
@@ -252,7 +271,12 @@ def backfill_history(conn: sqlite3.Connection) -> dict:
     return {"skins": len(skins), "inserted": total_inserted}
 
 
-def upsert_skin(conn: sqlite3.Connection, market_hash: str, image_url: str | None = None) -> int:
+def upsert_skin(
+    conn: sqlite3.Connection,
+    market_hash: str,
+    image_url: str | None = None,
+    rarity_color: str | None = None,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT OR IGNORE INTO skins (market_hash, first_seen) VALUES (?, ?)",
@@ -262,6 +286,11 @@ def upsert_skin(conn: sqlite3.Connection, market_hash: str, image_url: str | Non
         conn.execute(
             "UPDATE skins SET image_url = ? WHERE market_hash = ? AND (image_url IS NULL OR image_url != ?)",
             (image_url, market_hash, image_url),
+        )
+    if rarity_color:
+        conn.execute(
+            "UPDATE skins SET rarity_color = ? WHERE market_hash = ? AND (rarity_color IS NULL OR rarity_color != ?)",
+            (rarity_color, market_hash, rarity_color),
         )
     conn.commit()
     return conn.execute(
@@ -477,7 +506,7 @@ def ingest(
     """Store prices and run sell-signal analysis."""
     close_after = conn is None
     if conn is None:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect()
         init_db(conn)
 
     stored = 0
@@ -489,7 +518,7 @@ def ingest(
         if not price:
             continue
 
-        skin_id = upsert_skin(conn, mh, item.get("image_url"))
+        skin_id = upsert_skin(conn, mh, item.get("image_url"), item.get("rarity_color"))
         record_price(conn, skin_id, price)
         stored += 1
 
@@ -506,7 +535,7 @@ def ingest(
 # ── CLI (local debugging only) ────────────────────────────────────────────────
 
 def _cmd_history(market_hash: str, limit: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     rows = conn.execute(
         """SELECT p.fetched_at, p.lowest_price, p.median_price, p.volume
            FROM prices p JOIN skins s ON s.id = p.skin_id
@@ -530,7 +559,7 @@ def _cmd_history(market_hash: str, limit: int) -> None:
 
 
 def _cmd_alerts(limit: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     rows = conn.execute(
         """SELECT a.alerted_at, a.alert_type, s.market_hash, a.current, a.reference, a.pct_above, a.reason
            FROM alerts a JOIN skins s ON s.id = a.skin_id

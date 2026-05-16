@@ -254,7 +254,7 @@ async function load() {
   const timestamps = skins.map(s => s.fetched_at).filter(Boolean);
   const latest = timestamps.sort().at(-1);
   document.getElementById("meta").textContent = latest
-    ? `Last updated ${new Date(latest + "Z").toLocaleString()}`
+    ? `Last updated ${new Date(latest).toLocaleString()}`
     : "No price data yet";
 
   const grid = document.getElementById("grid");
@@ -291,10 +291,13 @@ function buildCard(skin) {
     ? `<img class="item-img" src="${esc(skin.image_url)}" alt="" loading="lazy">`
     : `<div class="item-img-placeholder"></div>`;
 
+  const safeColor = /^[0-9a-fA-F]{6}$/.test(skin.rarity_color || "") ? skin.rarity_color : null;
+  const nameStyle = safeColor ? ` style="color: #${safeColor}"` : "";
+
   card.innerHTML = `
     <div class="card-header">
       ${imgHtml}
-      <div class="card-name" title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
+      <div class="card-name"${nameStyle} title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
     </div>
     <div class="prices">
       <div class="price-block">

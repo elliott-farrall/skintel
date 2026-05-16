@@ -39,7 +39,7 @@ def require_auth(f):
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(tr.DB_PATH)
+    conn = tr.connect()
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -57,7 +57,7 @@ def run_collect() -> None:
             {"market_hash": i["market_hash"], "price": i["price"], "image_url": i.get("image_url")}
             for i in items if i.get("price")
         ]
-        conn = sqlite3.connect(tr.DB_PATH)
+        conn = tr.connect()
         tr.init_db(conn)
         tr.ingest(payload, conn=conn)
         conn.close()
@@ -72,7 +72,7 @@ def run_backfill() -> None:
         log.info("Backfill already running — skipping")
         return
     try:
-        conn = sqlite3.connect(tr.DB_PATH)
+        conn = tr.connect()
         tr.init_db(conn)
         result = tr.backfill_history(conn)
         conn.close()
@@ -95,7 +95,7 @@ def api_skins():
     conn = get_db()
 
     skins = conn.execute("""
-        SELECT s.id, s.market_hash, s.image_url,
+        SELECT s.id, s.market_hash, s.image_url, s.rarity_color,
                p.lowest_price, p.median_price, p.volume, p.fetched_at
         FROM skins s
         LEFT JOIN prices p ON p.id = (
@@ -147,6 +147,7 @@ def api_skins():
             "id": sid,
             "market_hash": s["market_hash"],
             "image_url": s["image_url"],
+            "rarity_color": s["rarity_color"],
             "lowest_price": s["lowest_price"],
             "median_price": s["median_price"],
             "volume": s["volume"],
@@ -212,7 +213,7 @@ def _startup() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    conn = sqlite3.connect(tr.DB_PATH)
+    conn = tr.connect()
     tr.init_db(conn)
     conn.close()
 
