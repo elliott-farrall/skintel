@@ -134,44 +134,43 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
     return items
 
 
-def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
-    """Fetch price history for one item from steamwebapi.com."""
-    url = "https://www.steamwebapi.com/steam/api/history"
+def fetch_price_history(market_hash: str) -> list[dict]:
+    """Fetch price history from Steam market directly (no API key needed)."""
     resp = requests.get(
-        url,
-        params={"key": api_key, "market_hash_name": market_hash},
+        "https://steamcommunity.com/market/pricehistory/",
+        params={"appid": APPID, "market_hash_name": market_hash},
+        headers={"User-Agent": "Mozilla/5.0"},
         timeout=30,
     )
-    if resp.status_code == 404:
-        log.info("No history for %s", market_hash)
-        return []
     if resp.status_code == 429:
         log.warning("Rate limited on history for %s", market_hash)
         return []
     if not resp.ok:
-        log.warning("History HTTP %d for %s — %s", resp.status_code, market_hash, resp.text[:200])
+        log.warning("History HTTP %d for %s", resp.status_code, market_hash)
         return []
 
-    entries = resp.json()
-    if not isinstance(entries, list):
-        log.warning("Unexpected history shape for %s: %s", market_hash, str(entries)[:200])
+    data = resp.json()
+    if not data.get("success"):
         return []
 
     rows = []
-    for entry in entries:
+    for entry in data.get("prices", []):
         try:
+            # entry format: ["Nov 27 2013 01:+0", 12.5, "3"]
+            date_part = str(entry[0])[:12].strip()  # "Nov 27 2013"
+            dt = datetime.strptime(date_part, "%b %d %Y").replace(hour=12, tzinfo=timezone.utc)
             rows.append({
-                "fetched_at": entry["createdat"],
-                "median_price": float(entry["price"]) if entry.get("price") is not None else None,
+                "fetched_at": dt.isoformat(),
+                "median_price": float(entry[1]) if entry[1] is not None else None,
                 "lowest_price": None,
-                "volume": int(entry["sold"]) if entry.get("sold") is not None else None,
+                "volume": int(entry[2]) if entry[2] else None,
             })
         except Exception:
             continue
     return rows
 
 
-def backfill_history(conn: sqlite3.Connection, api_key: str) -> dict:
+def backfill_history(conn: sqlite3.Connection) -> dict:
     """Fetch historical prices for all tracked skins and insert missing rows."""
     skins = conn.execute("SELECT id, market_hash FROM skins").fetchall()
     total_inserted = 0
@@ -187,7 +186,7 @@ def backfill_history(conn: sqlite3.Connection, api_key: str) -> dict:
 
         log.info("Backfilling %s", market_hash)
         try:
-            rows = fetch_price_history(market_hash, api_key)
+            rows = fetch_price_history(market_hash)
         except Exception as exc:
             log.warning("History fetch failed for %s: %s", market_hash, exc)
             rows = []
