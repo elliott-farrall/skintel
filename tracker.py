@@ -140,18 +140,26 @@ def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
     url = "https://api.steamwebapi.com/steam/api/pricehistory"
     resp = requests.get(
         url,
-        params={"key": api_key, "market_hash_name": market_hash, "appid": APPID},
+        params={"key": api_key, "market_hash_name": market_hash, "game": "csgo"},
         timeout=30,
     )
+    if resp.status_code == 404:
+        log.info("No history for %s — body: %s", market_hash, resp.text[:200])
+        return []
     if resp.status_code == 429:
         log.warning("Rate limited on history for %s", market_hash)
         return []
-    resp.raise_for_status()
+    if not resp.ok:
+        log.warning("History HTTP %d for %s — body: %s", resp.status_code, market_hash, resp.text[:200])
+        return []
     data = resp.json()
 
     raw_prices = data if isinstance(data, list) else data.get("prices", [])
     if not raw_prices:
+        log.info("Empty history for %s — keys: %s", market_hash,
+                 list(data.keys()) if isinstance(data, dict) else type(data))
         return []
+    log.info("History sample for %s: %r", market_hash, raw_prices[0])
 
     rows = []
     for entry in raw_prices:
