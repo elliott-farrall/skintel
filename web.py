@@ -111,6 +111,28 @@ def api_skins():
         ORDER BY alerted_at DESC
     """).fetchall()
 
+    # Fetch chart history for all skins in one query (newest 90 per skin)
+    skin_ids = [s["id"] for s in skins]
+    history_by_skin: dict[int, list] = {}
+    if skin_ids:
+        placeholders = ",".join("?" * len(skin_ids))
+        hist_rows = conn.execute(f"""
+            SELECT skin_id, fetched_at, median_price
+            FROM (
+                SELECT skin_id, fetched_at, median_price,
+                       ROW_NUMBER() OVER (PARTITION BY skin_id ORDER BY fetched_at DESC) AS rn
+                FROM prices
+                WHERE skin_id IN ({placeholders}) AND median_price IS NOT NULL
+            )
+            WHERE rn <= 90
+            ORDER BY skin_id, fetched_at ASC
+        """, skin_ids).fetchall()
+        for row in hist_rows:
+            history_by_skin.setdefault(row["skin_id"], []).append({
+                "fetched_at": row["fetched_at"],
+                "median_price": row["median_price"],
+            })
+
     conn.close()
 
     alerts_by_skin: dict[int, list] = {}
@@ -130,6 +152,7 @@ def api_skins():
             "volume": s["volume"],
             "fetched_at": s["fetched_at"],
             "alerts": alerts_by_skin.get(sid, []),
+            "history": history_by_skin.get(sid, []),
         })
 
     result.sort(key=lambda x: (-len(x["alerts"]), -(x["median_price"] or 0)))
