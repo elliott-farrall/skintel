@@ -63,26 +63,25 @@ ALERT_LABELS = {
     "sell_signal":  "Sell Signal",
 }
 
-# GBP exchange rate cache (1-hour TTL)
-_gbp_rate: float | None = None
-_gbp_rate_ts: float = 0.0
+_STEAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; Skintel)",
+}
 
 
-def _get_gbp_rate() -> float:
-    global _gbp_rate, _gbp_rate_ts
-    now = time.time()
-    if _gbp_rate is not None and now - _gbp_rate_ts < 3600:
-        return _gbp_rate
+def _steam_headers() -> dict:
+    h = dict(_STEAM_HEADERS)
+    if STEAM_SESSION_COOKIE:
+        h["Cookie"] = f"steamLoginSecure={STEAM_SESSION_COOKIE}"
+    return h
+
+
+def _parse_gbp(val: str | float | None) -> float | None:
+    if val is None:
+        return None
     try:
-        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
-        resp.raise_for_status()
-        rate = float(resp.json()["rates"]["GBP"])
-        _gbp_rate, _gbp_rate_ts = rate, now
-        log.info("GBP rate updated: 1 USD = %.4f GBP", rate)
-        return rate
-    except Exception as exc:
-        log.warning("Failed to fetch GBP rate (%s) — using fallback", exc)
-        return _gbp_rate if _gbp_rate else 0.79
+        return round(float(str(val).replace("£", "").replace(",", "").strip()), 4)
+    except (ValueError, AttributeError):
+        return None
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
@@ -136,108 +135,94 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def get_inventory(steam_id: str, api_key: str) -> list[dict]:
-    """Fetch CS2 inventory with embedded prices from steamwebapi.com (prices in GBP)."""
-    url = "https://api.steamwebapi.com/steam/api/inventory"
-    resp = requests.get(
-        url,
-        params={"key": api_key, "steam_id": steam_id, "game": "csgo", "parse": 1},
+def get_inventory(steam_id: str) -> list[dict]:
+    """Fetch CS2 inventory from Steam and current GBP prices from Steam Market."""
+    # Step 1: public inventory endpoint — no auth required for public profiles
+    inv_resp = requests.get(
+        f"https://steamcommunity.com/inventory/{steam_id}/730/2",
+        params={"l": "english", "count": 5000},
+        headers=_steam_headers(),
         timeout=30,
     )
-    log.info("Inventory: HTTP %d", resp.status_code)
-    resp.raise_for_status()
-    raw = resp.json()
+    log.info("Inventory: HTTP %d", inv_resp.status_code)
+    inv_resp.raise_for_status()
+    inv_data = inv_resp.json()
 
-    entries = raw if isinstance(raw, list) else raw.get("items", raw.get("data", []))
-    if entries and not isinstance(entries, list):
-        log.warning("Unexpected response shape: %s", list(raw.keys()) if isinstance(raw, dict) else type(raw))
+    if not inv_data.get("success"):
+        log.warning("Steam inventory returned success=false — profile may be private")
         return []
 
-    if entries:
-        log.info("Sample item keys: %s", list(entries[0].keys()))
-        # Log every field that might carry colour/rarity data so we can debug misses
-        color_fields = {k: v for k, v in entries[0].items()
-                        if any(w in k.lower() for w in ("color", "colour", "rarity", "quality", "grade", "tag"))}
-        log.info("Sample item colour/rarity fields: %s", color_fields)
-
-    gbp = _get_gbp_rate()
+    desc_map = {
+        (d["classid"], d["instanceid"]): d
+        for d in inv_data.get("descriptions", [])
+    }
 
     seen: set[str] = set()
-    items = []
-    for entry in entries:
-        if not entry.get("marketable", 1):
+    to_price: list[dict] = []
+    for asset in inv_data.get("assets", []):
+        desc = desc_map.get((asset["classid"], asset["instanceid"]))
+        if not desc or not desc.get("marketable"):
             continue
-        mh = entry.get("market_hash_name") or entry.get("markethashname")
+        mh = desc.get("market_hash_name")
         if not mh or mh in seen:
             continue
         seen.add(mh)
 
-        def _price(val: str | float | None) -> float | None:
-            if val is None:
-                return None
-            try:
-                usd = float(str(val).replace("$", "").replace(",", "").strip())
-                return round(usd * gbp, 4)
-            except (ValueError, AttributeError):
-                return None
-
-        price = {
-            "lowest_price": _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
-            "median_price": _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
-            "volume":       entry.get("volume") or entry.get("pricesold"),
-        }
-        image_url = (
-            entry.get("image")
-            or entry.get("icon_url")
-            or entry.get("image_url")
-            or entry.get("icon")
-        )
-        rarity_color = (
-            entry.get("rarity_color")
-            or entry.get("rarityColor")
-            or entry.get("raritycolor")
-            or entry.get("color")
-            or entry.get("qualitycolor")
-            or entry.get("tag_rarity_color")
-        )
-        # Steam standard format: tags array with category="Rarity"
+        rarity_color: str | None = None
+        rarity_name: str = ""
+        for tag in desc.get("tags", []):
+            if tag.get("category") == "Rarity":
+                rarity_color = tag.get("color", "").lower().lstrip("#") or None
+                rarity_name = tag.get("localized_tag_name", "")
+                break
+        # Name-based fallback in case the tag has no colour hex
         if not rarity_color:
-            for tag in (entry.get("tags") or []):
-                if isinstance(tag, dict) and tag.get("category") == "Rarity":
-                    rarity_color = tag.get("color")
-                    break
-        if rarity_color:
-            rarity_color = str(rarity_color).lstrip("#").lower()
-            if not rarity_color or len(rarity_color) not in (3, 6):
-                rarity_color = None
-        # Fallback: derive colour from rarity name if the API didn't return a hex value
-        if not rarity_color:
-            rarity_name = (
-                entry.get("rarity")
-                or entry.get("rarityName")
-                or entry.get("rarity_name")
-                or entry.get("quality")
-                or entry.get("type")
-                or ""
-            )
-            rarity_lower = str(rarity_name).lower()
+            rarity_lower = rarity_name.lower()
             for keyword, hex_color in _RARITY_NAME_TO_COLOR.items():
                 if keyword in rarity_lower:
                     rarity_color = hex_color
                     break
 
-        items.append({
+        icon = desc.get("icon_url", "")
+        image_url = f"https://steamcommunity-a.akamaihd.net/economy/image/{icon}" if icon else None
+
+        to_price.append({
             "market_hash": mh,
-            "name": entry.get("name", mh),
-            "price": price,
             "image_url": image_url,
             "rarity_color": rarity_color,
         })
 
-    no_color = [i["market_hash"] for i in items if not i["rarity_color"]]
-    if no_color:
-        log.warning("No rarity_color resolved for %d item(s): %s", len(no_color), no_color[:5])
-    log.info("Found %d unique marketable items", len(items))
+    log.info("Found %d unique marketable items — fetching prices", len(to_price))
+
+    # Step 2: fetch current GBP price for each item from Steam Market
+    items: list[dict] = []
+    for item in to_price:
+        try:
+            pr = requests.get(
+                "https://steamcommunity.com/market/priceoverview/",
+                params={"appid": APPID, "currency": 2, "market_hash_name": item["market_hash"]},
+                headers=_steam_headers(),
+                timeout=15,
+            )
+            if pr.status_code == 429:
+                log.warning("Rate limited fetching price for %s — skipping", item["market_hash"])
+                time.sleep(5)
+                continue
+            if not pr.ok:
+                log.warning("Price HTTP %d for %s", pr.status_code, item["market_hash"])
+                continue
+            p = pr.json()
+            item["price"] = {
+                "lowest_price": _parse_gbp(p.get("lowest_price")),
+                "median_price": _parse_gbp(p.get("median_price")),
+                "volume": int(str(p["volume"]).replace(",", "")) if p.get("volume") else None,
+            }
+            items.append(item)
+        except Exception as exc:
+            log.warning("Price fetch failed for %s: %s", item["market_hash"], exc)
+        time.sleep(0.5)
+
+    log.info("Priced %d/%d items", len(items), len(to_price))
     return items
 
 

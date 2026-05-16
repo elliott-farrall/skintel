@@ -11,10 +11,10 @@ Automated CS2 inventory price tracker. Polls your Steam inventory on a schedule,
                        │ triggers run_collect()
                        ▼
             ┌────────────────────────┐
-            │   steamwebapi.com      │  fetch inventory + current prices (USD)
+            │  steamcommunity.com    │  fetch inventory (public API)
+            │  /market/priceoverview │  fetch current GBP price per item
             └──────────┬─────────────┘
                        │
-                       ▼ convert USD → GBP via open.er-api.com (1h cached)
             ┌────────────────────────┐
             │  SQLite (/data/...)    │  upsert skins, append a row to prices
             └──────────┬─────────────┘
@@ -79,15 +79,14 @@ Alerts have a 24-hour per-(skin, type) cooldown to prevent spam.
 | Variable               | Required | Default          | Purpose                                                    |
 | ---------------------- | -------- | ---------------- | ---------------------------------------------------------- |
 | `STEAM_ID`             | yes      | —                | Your 64-bit Steam ID                                       |
-| `STEAMWEBAPI_KEY`      | yes      | —                | API key from steamwebapi.com (inventory + prices)          |
-| `STEAM_SESSION_COOKIE` | for backfill | —            | `steamLoginSecure` cookie value (Steam market auth)        |
 | `ANTHROPIC_API_KEY`    | yes      | —                | Claude API key for sell-signal analysis                    |
+| `DASHBOARD_PASS`       | yes      | (empty = locked) | HTTP Basic Auth password                                   |
+| `STEAM_SESSION_COOKIE` | recommended | —             | `steamLoginSecure` cookie — improves price-fetch rate limits and enables history backfill |
 | `DISCORD_BOT_TOKEN`    | for alerts | —              | Bot token (must share a server with you or be user-installed) |
 | `DISCORD_USER_ID`      | for alerts | —              | Your Discord user ID (DM target)                           |
 | `DASHBOARD_USER`       | no       | `admin`          | HTTP Basic Auth username                                   |
-| `DASHBOARD_PASS`       | yes      | (empty = locked) | HTTP Basic Auth password                                   |
 | `SKINTEL_DB`           | no       | `skintel.db`     | SQLite path (Fly volume mounts `/data/skintel.db`)         |
-| `SCHEDULE_HOURS`       | no       | `6`              | Collect interval                                           |
+| `SCHEDULE_HOURS`       | no       | `6`              | Collect interval in hours                                  |
 | `MIN_SELL_PRICE`       | no       | `1.00`           | Skip Claude analysis for skins below this £ value          |
 | `SKINTEL_CLAUDE_MODEL` | no       | `claude-haiku-4-5` | Model used for sell-signal analysis                      |
 | `PORT`                 | no       | `8080`           | HTTP port                                                  |

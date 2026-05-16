@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 DASHBOARD_USER   = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASS   = os.getenv("DASHBOARD_PASS", "")
 STEAM_ID         = os.getenv("STEAM_ID", "")
-STEAMWEBAPI_KEY  = os.getenv("STEAMWEBAPI_KEY", "")
 SCHEDULE_HOURS   = int(os.getenv("SCHEDULE_HOURS", "6"))
 
 app = Flask(__name__)
@@ -74,7 +73,7 @@ def run_collect() -> None:
         log.info("Collect already running — skipping")
         return
     try:
-        items = tr.get_inventory(STEAM_ID, STEAMWEBAPI_KEY)
+        items = tr.get_inventory(STEAM_ID)
         if not items:
             log.info("No marketable items — nothing to ingest")
             return
