@@ -1,27 +1,28 @@
-"""Flask web app — dashboard and ingest endpoint."""
+"""Flask web app — dashboard, scheduler, and API."""
 
 import os
+import threading
 import sqlite3
 import logging
 import functools
 
-import requests
 from flask import Flask, render_template, jsonify, request, Response
+from apscheduler.schedulers.background import BackgroundScheduler
 
 import tracker as tr
 
 log = logging.getLogger(__name__)
 
-DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
-DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "")
-STEAM_ID       = os.getenv("STEAM_ID", "")
-INGEST_TOKEN   = os.getenv("INGEST_TOKEN", "")
-GH_TOKEN       = os.getenv("GH_TOKEN", "")
-GH_REPO        = os.getenv("GH_REPO", "")
-SPIKE_THRESHOLD = float(os.getenv("SPIKE_THRESHOLD", "20"))
-ROLLING_DAYS    = int(os.getenv("ROLLING_DAYS", "7"))
+DASHBOARD_USER   = os.getenv("DASHBOARD_USER", "admin")
+DASHBOARD_PASS   = os.getenv("DASHBOARD_PASS", "")
+STEAM_ID         = os.getenv("STEAM_ID", "")
+STEAMWEBAPI_KEY  = os.getenv("STEAMWEBAPI_KEY", "")
+SPIKE_THRESHOLD  = float(os.getenv("SPIKE_THRESHOLD", "20"))
+ROLLING_DAYS     = int(os.getenv("ROLLING_DAYS", "7"))
+SCHEDULE_HOURS   = int(os.getenv("SCHEDULE_HOURS", "6"))
 
 app = Flask(__name__)
+_run_lock = threading.Lock()
 
 
 def require_auth(f):
@@ -38,20 +39,30 @@ def require_auth(f):
     return decorated
 
 
-def require_token(f):
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        if not INGEST_TOKEN or auth != f"Bearer {INGEST_TOKEN}":
-            return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(tr.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def run_collect() -> None:
+    if not _run_lock.acquire(blocking=False):
+        log.info("Collect already running — skipping")
+        return
+    try:
+        items = tr.get_inventory(STEAM_ID, STEAMWEBAPI_KEY)
+        if not items:
+            log.info("No marketable items — nothing to ingest")
+            return
+        payload = [{"market_hash": i["market_hash"], "price": i["price"]} for i in items if i.get("price")]
+        conn = sqlite3.connect(tr.DB_PATH)
+        tr.init_db(conn)
+        tr.ingest(payload, SPIKE_THRESHOLD, ROLLING_DAYS, conn=conn)
+        conn.close()
+    except Exception:
+        log.exception("Collect failed")
+    finally:
+        _run_lock.release()
 
 
 @app.route("/")
@@ -120,51 +131,23 @@ def api_history(skin_id: int):
     return jsonify([dict(r) for r in reversed(rows)])
 
 
-@app.route("/api/ingest", methods=["POST"])
-@require_token
-def api_ingest():
-    data = request.get_json(force=True)
-    if not data or "items" not in data:
-        return jsonify({"error": "missing items"}), 400
-
-    result = tr.ingest(
-        data["items"],
-        float(data.get("threshold_pct", SPIKE_THRESHOLD)),
-        int(data.get("rolling_days", ROLLING_DAYS)),
-    )
-    return jsonify(result)
-
-
 @app.route("/api/run", methods=["POST"])
 @require_auth
 def api_run():
-    if not GH_TOKEN or not GH_REPO:
-        return jsonify({"error": "GH_TOKEN and GH_REPO not configured"}), 503
-
-    resp = requests.post(
-        f"https://api.github.com/repos/{GH_REPO}/actions/workflows/track.yml/dispatches",
-        json={"ref": "main"},
-        headers={
-            "Authorization": f"Bearer {GH_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        timeout=15,
-    )
-    if resp.status_code == 204:
-        return jsonify({"status": "dispatched"})
-    return jsonify({"error": resp.text}), resp.status_code
+    if _run_lock.locked():
+        return jsonify({"status": "already_running"})
+    t = threading.Thread(target=run_collect, daemon=True)
+    t.start()
+    return jsonify({"status": "started"})
 
 
 @app.route("/api/status")
 @require_auth
 def api_status():
     conn = get_db()
-    row = conn.execute(
-        "SELECT MAX(fetched_at) as last_run FROM prices"
-    ).fetchone()
+    row = conn.execute("SELECT MAX(fetched_at) as last_run FROM prices").fetchone()
     conn.close()
-    return jsonify({"last_run": row["last_run"] if row else None})
+    return jsonify({"last_run": row["last_run"] if row else None, "running": _run_lock.locked()})
 
 
 if __name__ == "__main__":
@@ -177,6 +160,10 @@ if __name__ == "__main__":
     conn = sqlite3.connect(tr.DB_PATH)
     tr.init_db(conn)
     conn.close()
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_collect, "interval", hours=SCHEDULE_HOURS)
+    scheduler.start()
 
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, use_reloader=False)

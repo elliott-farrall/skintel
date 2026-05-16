@@ -261,10 +261,17 @@ def check_volume_surge(
     return True
 
 
-def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
-    """Store prices and run detection. Used by /api/ingest and local runs."""
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+def ingest(
+    items: list[dict],
+    threshold_pct: float,
+    rolling_days: int,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Store prices and run detection."""
+    close_after = conn is None
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        init_db(conn)
 
     stored = 0
     alert_count = 0
@@ -289,7 +296,8 @@ def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
             if check_volume_surge(conn, skin_id, mh, price["volume"], rolling_days):
                 alert_count += 1
 
-    conn.close()
+    if close_after:
+        conn.close()
     log.info("Ingest complete. %d stored, %d alert(s).", stored, alert_count)
     return {"stored": stored, "alerts": alert_count}
 
