@@ -17,8 +17,6 @@ DASHBOARD_USER   = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASS   = os.getenv("DASHBOARD_PASS", "")
 STEAM_ID         = os.getenv("STEAM_ID", "")
 STEAMWEBAPI_KEY  = os.getenv("STEAMWEBAPI_KEY", "")
-SPIKE_THRESHOLD  = float(os.getenv("SPIKE_THRESHOLD", "20"))
-ROLLING_DAYS     = int(os.getenv("ROLLING_DAYS", "7"))
 SCHEDULE_HOURS   = int(os.getenv("SCHEDULE_HOURS", "6"))
 
 app = Flask(__name__)
@@ -61,7 +59,7 @@ def run_collect() -> None:
         ]
         conn = sqlite3.connect(tr.DB_PATH)
         tr.init_db(conn)
-        tr.ingest(payload, SPIKE_THRESHOLD, ROLLING_DAYS, conn=conn)
+        tr.ingest(payload, conn=conn)
         conn.close()
     except Exception:
         log.exception("Collect failed")
