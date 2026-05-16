@@ -1,12 +1,12 @@
-"""CS2 skin price tracker — core library and collect CLI."""
+"""CS2 skin price tracker — core library."""
 
 import os
-import time
 import sqlite3
 import logging
 import argparse
-import requests
 from datetime import datetime, timezone
+
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,23 +17,9 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
 
-PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
-
-PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://steamcommunity.com/",
-}
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -65,6 +51,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     for sql in [
         "ALTER TABLE alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'spike'",
         "ALTER TABLE alerts ADD COLUMN reference REAL",
+        "ALTER TABLE skins ADD COLUMN image_url TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -85,7 +72,6 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
     resp.raise_for_status()
     raw = resp.json()
 
-    # Response is either a list of items or {"items": [...]}
     entries = raw if isinstance(raw, list) else raw.get("items", raw.get("data", []))
     if entries and not isinstance(entries, list):
         log.warning("Unexpected response shape: %s", list(raw.keys()) if isinstance(raw, dict) else type(raw))
@@ -113,49 +99,38 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
                 return None
 
         price = {
-            "lowest_price":  _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
-            "median_price":  _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
-            "volume":        entry.get("volume") or entry.get("pricesold"),
+            "lowest_price": _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
+            "median_price": _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
+            "volume":       entry.get("volume") or entry.get("pricesold"),
         }
-        items.append({"market_hash": mh, "name": entry.get("name", mh), "price": price})
+        image_url = (
+            entry.get("image")
+            or entry.get("icon_url")
+            or entry.get("image_url")
+            or entry.get("icon")
+        )
+        items.append({
+            "market_hash": mh,
+            "name": entry.get("name", mh),
+            "price": price,
+            "image_url": image_url,
+        })
 
     log.info("Found %d unique marketable items", len(items))
     return items
 
 
-def fetch_price(market_hash: str) -> dict | None:
-    params = {"appid": APPID, "market_hash_name": market_hash, "currency": 1}
-    try:
-        resp = requests.get(PRICE_URL, params=params, headers=HEADERS, timeout=15)
-        if resp.status_code == 429:
-            log.warning("Rate limited fetching %s — skipping", market_hash)
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("success"):
-            return None
-
-        def parse_usd(s: str | None) -> float | None:
-            if not s:
-                return None
-            return float(s.replace("$", "").replace(",", "").strip())
-
-        return {
-            "lowest_price": parse_usd(data.get("lowest_price")),
-            "median_price": parse_usd(data.get("median_price")),
-            "volume": int(data["volume"].replace(",", "")) if data.get("volume") else None,
-        }
-    except Exception as exc:
-        log.warning("Price fetch error for %s: %s", market_hash, exc)
-        return None
-
-
-def upsert_skin(conn: sqlite3.Connection, market_hash: str) -> int:
+def upsert_skin(conn: sqlite3.Connection, market_hash: str, image_url: str | None = None) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT OR IGNORE INTO skins (market_hash, first_seen) VALUES (?, ?)",
         (market_hash, now),
     )
+    if image_url:
+        conn.execute(
+            "UPDATE skins SET image_url = ? WHERE market_hash = ? AND (image_url IS NULL OR image_url != ?)",
+            (image_url, market_hash, image_url),
+        )
     conn.commit()
     return conn.execute(
         "SELECT id FROM skins WHERE market_hash = ?", (market_hash,)
@@ -282,7 +257,7 @@ def ingest(
         if not price:
             continue
 
-        skin_id = upsert_skin(conn, mh)
+        skin_id = upsert_skin(conn, mh, item.get("image_url"))
         record_price(conn, skin_id, price)
         stored += 1
 
@@ -302,48 +277,7 @@ def ingest(
     return {"stored": stored, "alerts": alert_count}
 
 
-def collect(
-    steam_id: str,
-    api_key: str,
-    push_url: str,
-    push_token: str,
-    threshold_pct: float,
-    rolling_days: int,
-) -> None:
-    """Fetch inventory + prices then POST to Fly.io /api/ingest."""
-    items = get_inventory(steam_id, api_key)
-    if not items:
-        log.info("No marketable items — nothing to collect")
-        return
-
-    payload_items = []
-    for i, item in enumerate(items):
-        price = item.get("price") or {}
-        if price.get("median_price") is not None or price.get("lowest_price") is not None:
-            payload_items.append({"market_hash": item["market_hash"], "price": price})
-            log.info("[%d/%d] %s  median=$%s  vol=%s",
-                     i + 1, len(items), item["market_hash"],
-                     price.get("median_price"), price.get("volume"))
-        else:
-            log.info("[%d/%d] %s — no price", i + 1, len(items), item["market_hash"])
-
-    payload = {
-        "items": payload_items,
-        "threshold_pct": threshold_pct,
-        "rolling_days": rolling_days,
-    }
-    resp = requests.post(
-        push_url,
-        json=payload,
-        headers={"Authorization": f"Bearer {push_token}"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    log.info("Ingest response: %s", result)
-
-
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── CLI (local debugging only) ────────────────────────────────────────────────
 
 def _cmd_history(market_hash: str, limit: int) -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -397,14 +331,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CS2 skin price tracker")
     sub = parser.add_subparsers(dest="cmd")
 
-    collect_p = sub.add_parser("collect", help="Fetch inventory+prices and POST to ingest URL")
-    collect_p.add_argument("--steam-id", required=True)
-    collect_p.add_argument("--api-key", required=True, help="steamwebapi.com API key")
-    collect_p.add_argument("--push-url", required=True, help="URL of /api/ingest on Fly.io")
-    collect_p.add_argument("--push-token", required=True, help="INGEST_TOKEN secret")
-    collect_p.add_argument("--threshold", type=float, default=20.0)
-    collect_p.add_argument("--days", type=int, default=7)
-
     hist_p = sub.add_parser("history", help="Show price history for a skin")
     hist_p.add_argument("market_hash")
     hist_p.add_argument("--limit", type=int, default=30)
@@ -414,9 +340,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "collect":
-        collect(args.steam_id, args.api_key, args.push_url, args.push_token, args.threshold, args.days)
-    elif args.cmd == "history":
+    if args.cmd == "history":
         _cmd_history(args.market_hash, args.limit)
     elif args.cmd == "alerts":
         _cmd_alerts(args.limit)

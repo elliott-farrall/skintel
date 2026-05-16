@@ -91,6 +91,27 @@
       gap: 0.7rem;
     }
 
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+
+    .item-img {
+      width: 48px;
+      height: 36px;
+      object-fit: contain;
+      flex-shrink: 0;
+      border-radius: 4px;
+      background: #1a1a1a;
+    }
+
+    .item-img-placeholder {
+      width: 48px;
+      height: 36px;
+      flex-shrink: 0;
+    }
+
     .card.alerted {
       border-color: #22543d;
       box-shadow: 0 0 0 1px #4ade8015;
@@ -271,8 +292,15 @@ function buildCard(skin) {
   const inventoryUrl =
     `https://steamcommunity.com/profiles/${STEAM_ID}/inventory/#730`;
 
+  const imgHtml = skin.image_url
+    ? `<img class="item-img" src="${esc(skin.image_url)}" alt="" loading="lazy">`
+    : `<div class="item-img-placeholder"></div>`;
+
   card.innerHTML = `
-    <div class="card-name" title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
+    <div class="card-header">
+      ${imgHtml}
+      <div class="card-name" title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
+    </div>
     <div class="prices">
       <div class="price-block">
         <div class="plabel">Median</div>
@@ -302,14 +330,17 @@ async function loadChart(skinId) {
     if (!res.ok) return;
     data = await res.json();
   } catch { return; }
-  if (!data.length) return;
+  if (data.length < 2) return;
 
   const canvas = document.getElementById(`chart-${skinId}`);
   if (!canvas) return;
 
   const prices = data.map(d => d.median_price);
-  const min = Math.min(...prices.filter(p => p != null)) * 0.97;
-  const max = Math.max(...prices.filter(p => p != null)) * 1.03;
+  const valid = prices.filter(p => p != null);
+  const rawMin = Math.min(...valid), rawMax = Math.max(...valid);
+  const padding = rawMin === rawMax ? rawMin * 0.05 || 0.5 : 0;
+  const min = rawMin * 0.97 - padding;
+  const max = rawMax * 1.03 + padding;
 
   new Chart(canvas, {
     type: "line",
@@ -369,8 +400,6 @@ async function triggerRun() {
 
   setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 20000);
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function esc(s) {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");

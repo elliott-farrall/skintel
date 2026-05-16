@@ -54,7 +54,7 @@ def run_collect() -> None:
         if not items:
             log.info("No marketable items — nothing to ingest")
             return
-        payload = [{"market_hash": i["market_hash"], "price": i["price"]} for i in items if i.get("price")]
+        payload = [{"market_hash": i["market_hash"], "price": i["price"], "image_url": i.get("image_url")} for i in items if i.get("price")]
         conn = sqlite3.connect(tr.DB_PATH)
         tr.init_db(conn)
         tr.ingest(payload, SPIKE_THRESHOLD, ROLLING_DAYS, conn=conn)
@@ -77,7 +77,7 @@ def api_skins():
     conn = get_db()
 
     skins = conn.execute("""
-        SELECT s.id, s.market_hash,
+        SELECT s.id, s.market_hash, s.image_url,
                p.lowest_price, p.median_price, p.volume, p.fetched_at
         FROM skins s
         LEFT JOIN prices p ON p.id = (
@@ -106,6 +106,7 @@ def api_skins():
         result.append({
             "id": sid,
             "market_hash": s["market_hash"],
+            "image_url": s["image_url"],
             "lowest_price": s["lowest_price"],
             "median_price": s["median_price"],
             "volume": s["volume"],
