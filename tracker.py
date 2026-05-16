@@ -18,7 +18,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_USER_ID   = os.getenv("DISCORD_USER_ID", "")
 
 APPID = 730
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
@@ -259,8 +260,9 @@ def _send_discord_alert(
     pct_above: float | None,
     image_url: str | None = None,
 ) -> None:
-    if not DISCORD_WEBHOOK_URL:
+    if not DISCORD_BOT_TOKEN or not DISCORD_USER_ID:
         return
+
     label = ALERT_LABELS.get(alert_type, alert_type.replace("_", " ").title())
     color = ALERT_COLORS.get(alert_type, 0x4ADE80)
 
@@ -280,16 +282,28 @@ def _send_discord_alert(
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
     try:
-        resp = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"embeds": [embed]},
+        # Open (or retrieve) DM channel with the user
+        dm = requests.post(
+            "https://discord.com/api/v10/users/@me/channels",
+            json={"recipient_id": DISCORD_USER_ID},
+            headers=headers,
             timeout=10,
         )
-        if resp.status_code not in (200, 204):
-            log.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+        dm.raise_for_status()
+        channel_id = dm.json()["id"]
+
+        msg = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            json={"embeds": [embed]},
+            headers=headers,
+            timeout=10,
+        )
+        if msg.status_code not in (200, 201):
+            log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
     except Exception as exc:
-        log.warning("Discord webhook failed: %s", exc)
+        log.warning("Discord DM failed: %s", exc)
 
 
 def _insert_alert(
