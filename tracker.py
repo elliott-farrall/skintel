@@ -38,6 +38,24 @@ def _get_anthropic_client() -> "anthropic.Anthropic":
 
 APPID = 730
 
+# CS2 standard rarity colours — used as a fallback when the API doesn't return a hex value
+_RARITY_NAME_TO_COLOR: dict[str, str] = {
+    "consumer":    "b0c3d9",
+    "industrial":  "5e98d9",
+    "mil-spec":    "4b69ff",
+    "milspec":     "4b69ff",
+    "restricted":  "8847ff",
+    "classified":  "d32ce6",
+    "covert":      "eb4b4b",
+    "contraband":  "e4ae39",
+    "extraordinary": "ffd700",
+    "master":      "ffd700",
+    "high grade":  "4b69ff",
+    "remarkable":  "8847ff",
+    "exotic":      "d32ce6",
+    "distinguished": "5e98d9",
+}
+
 ALERT_COLORS = {
     "sell_signal":  0x4ADE80,  # green
 }
@@ -137,6 +155,10 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
 
     if entries:
         log.info("Sample item keys: %s", list(entries[0].keys()))
+        # Log every field that might carry colour/rarity data so we can debug misses
+        color_fields = {k: v for k, v in entries[0].items()
+                        if any(w in k.lower() for w in ("color", "colour", "rarity", "quality", "grade", "tag"))}
+        log.info("Sample item colour/rarity fields: %s", color_fields)
 
     gbp = _get_gbp_rate()
 
@@ -188,6 +210,21 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
             rarity_color = str(rarity_color).lstrip("#").lower()
             if not rarity_color or len(rarity_color) not in (3, 6):
                 rarity_color = None
+        # Fallback: derive colour from rarity name if the API didn't return a hex value
+        if not rarity_color:
+            rarity_name = (
+                entry.get("rarity")
+                or entry.get("rarityName")
+                or entry.get("rarity_name")
+                or entry.get("quality")
+                or entry.get("type")
+                or ""
+            )
+            rarity_lower = str(rarity_name).lower()
+            for keyword, hex_color in _RARITY_NAME_TO_COLOR.items():
+                if keyword in rarity_lower:
+                    rarity_color = hex_color
+                    break
 
         items.append({
             "market_hash": mh,
@@ -197,6 +234,9 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
             "rarity_color": rarity_color,
         })
 
+    no_color = [i["market_hash"] for i in items if not i["rarity_color"]]
+    if no_color:
+        log.warning("No rarity_color resolved for %d item(s): %s", len(no_color), no_color[:5])
     log.info("Found %d unique marketable items", len(items))
     return items
 
