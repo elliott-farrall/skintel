@@ -1,7 +1,6 @@
 """CS2 skin price tracker — core library."""
 
 import os
-import re
 import time
 import sqlite3
 import logging
@@ -136,47 +135,36 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
 
 
 def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
-    """Fetch up to 365 days of price history for one item."""
-    url = "https://api.steamwebapi.com/steam/api/prices"
+    """Fetch price history for one item from steamwebapi.com."""
+    url = "https://www.steamwebapi.com/steam/api/history"
     resp = requests.get(
         url,
-        params={"key": api_key, "market_hash_name": market_hash, "game": "csgo"},
+        params={"key": api_key, "market_hash_name": market_hash},
         timeout=30,
     )
     if resp.status_code == 404:
-        log.info("No history for %s — body: %s", market_hash, resp.text[:200])
+        log.info("No history for %s", market_hash)
         return []
     if resp.status_code == 429:
         log.warning("Rate limited on history for %s", market_hash)
         return []
     if not resp.ok:
-        log.warning("History HTTP %d for %s — body: %s", resp.status_code, market_hash, resp.text[:200])
+        log.warning("History HTTP %d for %s — %s", resp.status_code, market_hash, resp.text[:200])
         return []
-    data = resp.json()
 
-    raw_prices = data if isinstance(data, list) else data.get("prices", [])
-    if not raw_prices:
-        log.info("Empty history for %s — keys: %s", market_hash,
-                 list(data.keys()) if isinstance(data, dict) else type(data))
+    entries = resp.json()
+    if not isinstance(entries, list):
+        log.warning("Unexpected history shape for %s: %s", market_hash, str(entries)[:200])
         return []
-    log.info("History sample for %s: %r", market_hash, raw_prices[0])
 
     rows = []
-    for entry in raw_prices:
+    for entry in entries:
         try:
-            date_str, price_val, vol_str = entry[0], entry[1], entry[2]
-            # "Nov 27 2013 01:+0" → parse just the date portion
-            m = re.match(r"(\w+ \d+ \d+)", str(date_str))
-            if not m:
-                continue
-            dt = datetime.strptime(m.group(1), "%b %d %Y").replace(
-                hour=12, tzinfo=timezone.utc
-            )
             rows.append({
-                "fetched_at": dt.isoformat(),
-                "median_price": float(price_val) if price_val else None,
+                "fetched_at": entry["createdat"],
+                "median_price": float(entry["price"]) if entry.get("price") is not None else None,
                 "lowest_price": None,
-                "volume": int(vol_str) if vol_str else None,
+                "volume": int(entry["sold"]) if entry.get("sold") is not None else None,
             })
         except Exception:
             continue
