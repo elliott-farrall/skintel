@@ -2,3 +2,4 @@ requests>=2.32
 flask>=3.0
 apscheduler>=3.10
 anthropic>=0.40
+gunicorn>=21.0
