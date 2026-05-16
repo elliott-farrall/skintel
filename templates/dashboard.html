@@ -297,8 +297,8 @@ function buildCard(skin) {
   }
   const badgesHtml = badges.join("");
 
-  const inventoryUrl =
-    `https://steamcommunity.com/profiles/${STEAM_ID}/inventory/#730`;
+  const marketUrl =
+    `https://steamcommunity.com/market/listings/730/${encodeURIComponent(skin.market_hash)}`;
 
   const imgHtml = skin.image_url
     ? `<img class="item-img" src="${esc(skin.image_url)}" alt="" loading="lazy">`
@@ -328,7 +328,7 @@ function buildCard(skin) {
     ${badgesHtml ? `<div class="badges">${badgesHtml}</div>` : ""}
     <div class="card-footer">
       <span class="vol">${skin.volume != null ? `Vol: ${skin.volume.toLocaleString()}` : ""}</span>
-      <a href="${inventoryUrl}" target="_blank" class="btn btn-steam">Open Inventory ↗</a>
+      <a href="${marketUrl}" target="_blank" class="btn btn-steam">Sell on Market ↗</a>
     </div>
   `;
   return card;
