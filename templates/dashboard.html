@@ -170,9 +170,7 @@
       border-radius: 4px;
     }
 
-    .badge-spike  { background: #3b0764; color: #c084fc; border: 1px solid #6b21a8; }
-    .badge-ath    { background: #450a0a; color: #f87171; border: 1px solid #991b1b; }
-    .badge-surge  { background: #431407; color: #fb923c; border: 1px solid #9a3412; }
+    .badge-sell   { background: #052e16; color: #4ade80; border: 1px solid #166534; }
 
     .card-footer {
       display: flex;
@@ -281,13 +279,11 @@ function buildCard(skin) {
   const card = document.createElement("div");
   card.className = "card" + (hasAlerts ? " alerted" : "");
 
-  const median  = skin.median_price  != null ? `$${skin.median_price.toFixed(2)}`  : "—";
-  const lowest  = skin.lowest_price  != null ? `$${skin.lowest_price.toFixed(2)}`  : "—";
+  const median  = skin.median_price  != null ? `£${skin.median_price.toFixed(2)}`  : "—";
+  const lowest  = skin.lowest_price  != null ? `£${skin.lowest_price.toFixed(2)}`  : "—";
 
   const badgesHtml = alertTypes.map(t => {
-    if (t === "spike")        return `<span class="badge badge-spike">Spike</span>`;
-    if (t === "all_time_high") return `<span class="badge badge-ath">ATH</span>`;
-    if (t === "volume_surge") return `<span class="badge badge-surge">Vol Surge</span>`;
+    if (t === "sell_signal")  return `<span class="badge badge-sell">Sell</span>`;
     return "";
   }).join("");
 
@@ -367,7 +363,7 @@ async function loadChart(skinId) {
         tooltip: {
           enabled: true,
           callbacks: {
-            label: ctx => ctx.parsed.y != null ? `$${ctx.parsed.y.toFixed(2)}` : "",
+            label: ctx => ctx.parsed.y != null ? `£${ctx.parsed.y.toFixed(2)}` : "",
             title: ctx => ctx[0]?.label?.slice(0, 16) ?? "",
           },
         },

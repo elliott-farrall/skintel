@@ -1,6 +1,7 @@
 """CS2 skin price tracker — core library."""
 
 import os
+import json
 import time
 import sqlite3
 import logging
@@ -8,6 +9,7 @@ import argparse
 from datetime import datetime, timezone
 
 import requests
+import anthropic
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,25 +18,43 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_PATH             = os.getenv("SKINTEL_DB", "skintel.db")
-DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
-DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "")
+DB_PATH              = os.getenv("SKINTEL_DB", "skintel.db")
+DISCORD_BOT_TOKEN    = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_USER_ID      = os.getenv("DISCORD_USER_ID", "")
 STEAM_SESSION_COOKIE = os.getenv("STEAM_SESSION_COOKIE", "")
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL         = os.getenv("SKINTEL_CLAUDE_MODEL", "claude-haiku-4-5")
+MIN_SELL_PRICE       = float(os.getenv("MIN_SELL_PRICE", "1.00"))  # GBP — skip cheaper skins entirely
 
 APPID = 730
-ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
-VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
 
 ALERT_COLORS = {
-    "spike":        0xC084FC,  # purple
-    "all_time_high": 0xF87171, # red
-    "volume_surge": 0xFB923C,  # orange
+    "sell_signal":  0x4ADE80,  # green
 }
 ALERT_LABELS = {
-    "spike":        "Price Spike",
-    "all_time_high": "All-Time High",
-    "volume_surge": "Volume Surge",
+    "sell_signal":  "Sell Signal",
 }
+
+# GBP exchange rate cache (1-hour TTL)
+_gbp_rate: float | None = None
+_gbp_rate_ts: float = 0.0
+
+
+def _get_gbp_rate() -> float:
+    global _gbp_rate, _gbp_rate_ts
+    now = time.time()
+    if _gbp_rate is not None and now - _gbp_rate_ts < 3600:
+        return _gbp_rate
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        resp.raise_for_status()
+        rate = float(resp.json()["rates"]["GBP"])
+        _gbp_rate, _gbp_rate_ts = rate, now
+        log.info("GBP rate updated: 1 USD = %.4f GBP", rate)
+        return rate
+    except Exception as exc:
+        log.warning("Failed to fetch GBP rate (%s) — using fallback", exc)
+        return _gbp_rate if _gbp_rate else 0.79
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -67,6 +87,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'spike'",
         "ALTER TABLE alerts ADD COLUMN reference REAL",
         "ALTER TABLE skins ADD COLUMN image_url TEXT",
+        "ALTER TABLE alerts ADD COLUMN reason TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -76,7 +97,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str, api_key: str) -> list[dict]:
-    """Fetch CS2 inventory with embedded prices from steamwebapi.com."""
+    """Fetch CS2 inventory with embedded prices from steamwebapi.com (prices in GBP)."""
     url = "https://api.steamwebapi.com/steam/api/inventory"
     resp = requests.get(
         url,
@@ -95,6 +116,8 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
     if entries:
         log.info("Sample item keys: %s", list(entries[0].keys()))
 
+    gbp = _get_gbp_rate()
+
     seen: set[str] = set()
     items = []
     for entry in entries:
@@ -109,7 +132,8 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
             if val is None:
                 return None
             try:
-                return float(str(val).replace("$", "").replace(",", "").strip())
+                usd = float(str(val).replace("$", "").replace(",", "").strip())
+                return round(usd * gbp, 4)
             except (ValueError, AttributeError):
                 return None
 
@@ -136,13 +160,13 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
 
 
 def fetch_price_history(market_hash: str) -> list[dict]:
-    """Fetch price history from Steam market (requires steamLoginSecure cookie)."""
+    """Fetch price history from Steam market in GBP (requires steamLoginSecure cookie)."""
     if not STEAM_SESSION_COOKIE:
         log.warning("STEAM_SESSION_COOKIE not set — skipping history fetch")
         return []
     resp = requests.get(
         "https://steamcommunity.com/market/pricehistory/",
-        params={"appid": APPID, "market_hash_name": market_hash},
+        params={"appid": APPID, "market_hash_name": market_hash, "currency": 2},
         headers={
             "User-Agent": "Mozilla/5.0",
             "Cookie": f"steamLoginSecure={STEAM_SESSION_COOKIE}",
@@ -163,14 +187,15 @@ def fetch_price_history(market_hash: str) -> list[dict]:
     rows = []
     for entry in data.get("prices", []):
         try:
-            # entry format: ["Nov 27 2013 01:+0", 12.5, "3"]
-            date_part = str(entry[0])[:12].strip()  # "Nov 27 2013"
+            # entry format: ["Nov 7 2013 01:+0", 12.5, "3"] or ["Nov 27 2013 01:+0", ...]
+            # Use split to handle both single and double digit days
+            date_part = " ".join(str(entry[0]).split()[:3])
             dt = datetime.strptime(date_part, "%b %d %Y").replace(hour=12, tzinfo=timezone.utc)
             rows.append({
                 "fetched_at": dt.isoformat(),
                 "median_price": float(entry[1]) if entry[1] is not None else None,
                 "lowest_price": None,
-                "volume": int(entry[2]) if entry[2] else None,
+                "volume": int(float(entry[2])) if entry[2] else None,
             })
         except Exception:
             continue
@@ -244,14 +269,7 @@ def record_price(conn: sqlite3.Connection, skin_id: int, price: dict) -> None:
     conn.commit()
 
 
-def rolling_average(conn: sqlite3.Connection, skin_id: int, days: int) -> float | None:
-    row = conn.execute(
-        """SELECT AVG(median_price) FROM prices
-           WHERE skin_id = ? AND median_price IS NOT NULL
-             AND fetched_at >= datetime('now', ?)""",
-        (skin_id, f"-{days} days"),
-    ).fetchone()
-    return row[0] if row else None
+_dm_channel_id: str | None = None
 
 
 def _send_discord_alert(
@@ -261,19 +279,23 @@ def _send_discord_alert(
     reference: float | None,
     pct_above: float | None,
     image_url: str | None = None,
+    reason: str | None = None,
 ) -> None:
+    global _dm_channel_id
     if not DISCORD_BOT_TOKEN or not DISCORD_USER_ID:
         return
 
     label = ALERT_LABELS.get(alert_type, alert_type.replace("_", " ").title())
     color = ALERT_COLORS.get(alert_type, 0x4ADE80)
 
-    fields = [{"name": "Current price", "value": f"${current:.2f}", "inline": True}]
+    fields = [{"name": "Current price", "value": f"£{current:.2f}", "inline": True}]
     if reference is not None:
-        fields.append({"name": "Reference", "value": f"${reference:.2f}", "inline": True})
+        fields.append({"name": "Reference", "value": f"£{reference:.2f}", "inline": True})
     if pct_above is not None:
         sign = "+" if pct_above >= 0 else ""
         fields.append({"name": "Change", "value": f"{sign}{pct_above:.1f}%", "inline": True})
+    if reason:
+        fields.append({"name": "Analysis", "value": reason, "inline": False})
 
     embed: dict = {
         "title": f"{label}: {market_hash}",
@@ -286,26 +308,36 @@ def _send_discord_alert(
 
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
     try:
-        # Open (or retrieve) DM channel with the user
-        dm = requests.post(
-            "https://discord.com/api/v10/users/@me/channels",
-            json={"recipient_id": DISCORD_USER_ID},
-            headers=headers,
-            timeout=10,
-        )
-        dm.raise_for_status()
-        channel_id = dm.json()["id"]
+        if _dm_channel_id is None:
+            dm = requests.post(
+                "https://discord.com/api/v10/users/@me/channels",
+                json={"recipient_id": DISCORD_USER_ID},
+                headers=headers,
+                timeout=10,
+            )
+            dm.raise_for_status()
+            _dm_channel_id = dm.json()["id"]
 
-        msg = requests.post(
-            f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            json={"embeds": [embed]},
-            headers=headers,
-            timeout=10,
-        )
-        if msg.status_code not in (200, 201):
-            log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
+        for attempt in range(2):
+            msg = requests.post(
+                f"https://discord.com/api/v10/channels/{_dm_channel_id}/messages",
+                json={"embeds": [embed]},
+                headers=headers,
+                timeout=10,
+            )
+            if msg.status_code == 429:
+                retry_after = float(msg.json().get("retry_after", 5))
+                log.warning("Discord rate limited — waiting %.1fs", retry_after)
+                time.sleep(retry_after)
+                continue
+            if msg.status_code not in (200, 201):
+                log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
+            break
     except Exception as exc:
         log.warning("Discord DM failed: %s", exc)
+
+
+ALERT_COOLDOWN_HOURS = 24
 
 
 def _insert_alert(
@@ -315,89 +347,125 @@ def _insert_alert(
     current: float,
     reference: float | None,
     pct_above: float | None,
+    reason: str | None = None,
 ) -> None:
+    # Suppress if same skin+type alerted within the cooldown window
+    recent = conn.execute(
+        """SELECT 1 FROM alerts
+           WHERE skin_id = ? AND alert_type = ?
+             AND alerted_at >= datetime('now', ?)
+           LIMIT 1""",
+        (skin_id, alert_type, f"-{ALERT_COOLDOWN_HOURS} hours"),
+    ).fetchone()
+    if recent:
+        return
+
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        """INSERT INTO alerts (skin_id, alerted_at, alert_type, current, reference, pct_above)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (skin_id, now, alert_type, current, reference, pct_above),
+        """INSERT INTO alerts (skin_id, alerted_at, alert_type, current, reference, pct_above, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (skin_id, now, alert_type, current, reference, pct_above, reason),
     )
     conn.commit()
 
     row = conn.execute("SELECT market_hash, image_url FROM skins WHERE id = ?", (skin_id,)).fetchone()
     if row:
-        _send_discord_alert(row[0], alert_type, current, reference, pct_above, row[1])
+        _send_discord_alert(row[0], alert_type, current, reference, pct_above, row[1], reason)
 
 
-def check_spike(
+def check_sell_signal(
     conn: sqlite3.Connection,
     skin_id: int,
     market_hash: str,
-    current: float,
-    threshold_pct: float,
-    rolling_days: int,
+    current_price: float,
 ) -> bool:
-    avg = rolling_average(conn, skin_id, rolling_days)
-    if not avg:
+    """Use Claude to detect if a skin has risen significantly and is near its peak."""
+    if not ANTHROPIC_API_KEY or current_price is None:
         return False
-    pct_above = (current - avg) / avg * 100
-    if pct_above < threshold_pct:
+
+    # Skip cheap skins — not worth the noise or API call
+    if current_price < MIN_SELL_PRICE:
         return False
-    _insert_alert(conn, skin_id, "spike", current, avg, pct_above)
-    log.warning("SPIKE  %s  $%.2f  avg=$%.2f  +%.1f%%", market_hash, current, avg, pct_above)
-    return True
 
-
-def check_all_time_high(
-    conn: sqlite3.Connection,
-    skin_id: int,
-    market_hash: str,
-    current: float,
-) -> bool:
-    row = conn.execute(
-        "SELECT MAX(median_price) FROM prices WHERE skin_id = ? AND median_price IS NOT NULL",
+    rows = conn.execute(
+        """SELECT fetched_at, median_price, volume FROM prices
+           WHERE skin_id = ? AND median_price IS NOT NULL
+           ORDER BY fetched_at DESC LIMIT 60""",
         (skin_id,),
-    ).fetchone()
-    if not row or not row[0]:
-        return False
-    ath = row[0]
-    if current < ath * ATH_PROXIMITY:
-        return False
-    pct = (current - ath) / ath * 100
-    _insert_alert(conn, skin_id, "all_time_high", current, ath, pct)
-    log.warning("ATH  %s  $%.2f  all-time-high=$%.2f", market_hash, current, ath)
-    return True
+    ).fetchall()
 
-
-def check_volume_surge(
-    conn: sqlite3.Connection,
-    skin_id: int,
-    market_hash: str,
-    current_volume: int,
-    rolling_days: int,
-) -> bool:
-    row = conn.execute(
-        """SELECT AVG(volume) FROM prices
-           WHERE skin_id = ? AND volume IS NOT NULL
-             AND fetched_at >= datetime('now', ?)""",
-        (skin_id, f"-{rolling_days} days"),
-    ).fetchone()
-    avg_vol = row[0] if row and row[0] else None
-    if not avg_vol or current_volume < avg_vol * VOLUME_SURGE_MULT:
+    if len(rows) < 7:
         return False
-    pct = (current_volume - avg_vol) / avg_vol * 100
-    _insert_alert(conn, skin_id, "volume_surge", float(current_volume), avg_vol, pct)
-    log.warning("VOL SURGE  %s  vol=%d  avg=%.0f  +%.1f%%", market_hash, current_volume, avg_vol, pct)
-    return True
+
+    prices = [r[1] for r in rows]   # newest first
+
+    avg_all    = sum(prices) / len(prices)
+    avg_recent = sum(prices[:5]) / 5
+    avg_older  = sum(prices[5:]) / (len(prices) - 5)
+    ath        = max(prices)
+    pct_vs_avg = (current_price - avg_all) / avg_all * 100
+    pct_vs_ath = (current_price - ath) / ath * 100           # negative means below ATH
+    trend_pct  = (avg_recent - avg_older) / avg_older * 100  # positive = rising recently
+
+    history_lines = "\n".join(
+        f"{r[0][:10]}: £{r[1]:.2f}" + (f" (vol {r[2]})" if r[2] else "")
+        for r in reversed(rows)
+    )
+
+    context = (
+        f"Skin: {market_hash}\n"
+        f"Current price: £{current_price:.2f}\n"
+        f"Historical average ({len(rows)} data points): £{avg_all:.2f} "
+        f"(current is {pct_vs_avg:+.1f}% vs average)\n"
+        f"All-time high in history: £{ath:.2f} "
+        f"(current is {pct_vs_ath:+.1f}% vs ATH)\n"
+        f"Recent trend: avg of last 5 = £{avg_recent:.2f} vs prior avg = £{avg_older:.2f} "
+        f"({trend_pct:+.1f}%)\n\n"
+        f"Price history (oldest → newest):\n{history_lines}"
+    )
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        resp = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=200,
+            system=(
+                "You are a CS2 skin market analyst. Your job is to identify the optimal moment to sell: "
+                "when a skin has risen substantially from its baseline price and appears to be at or near a peak.\n\n"
+                "Recommend SELL only if:\n"
+                "- The current price is notably above its historical average (a real rise, not noise)\n"
+                "- The price appears to be levelling off or showing early signs of a reversal after rising\n"
+                "- Selling now captures most of the gain before a likely pullback\n\n"
+                "Recommend HOLD if:\n"
+                "- The price is still actively climbing — don't sell too early\n"
+                "- The price is near its average or recent lows — the rise hasn't happened yet\n"
+                "- The movement looks like normal daily noise rather than a meaningful spike\n\n"
+                'Reply ONLY with JSON: {"recommend_sell": true, "reason": "one concise sentence"}'
+            ),
+            messages=[{"role": "user", "content": context}],
+        )
+        text = resp.content[0].text.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        data = json.loads(text[start:end])
+        recommend_sell = bool(data.get("recommend_sell", False))
+        reason = str(data.get("reason", ""))
+    except Exception as exc:
+        log.warning("Claude sell check failed for %s: %s", market_hash, exc)
+        return False
+
+    if recommend_sell:
+        log.info("SELL SIGNAL  %s  £%.2f (+%.1f%% vs avg)  reason=%s",
+                 market_hash, current_price, pct_vs_avg, reason)
+        _insert_alert(conn, skin_id, "sell_signal", current_price, avg_all, pct_vs_avg, reason=reason)
+    return recommend_sell
 
 
 def ingest(
     items: list[dict],
-    threshold_pct: float,
-    rolling_days: int,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
-    """Store prices and run detection."""
+    """Store prices and run sell-signal analysis."""
     close_after = conn is None
     if conn is None:
         conn = sqlite3.connect(DB_PATH)
@@ -417,18 +485,12 @@ def ingest(
         stored += 1
 
         if price.get("median_price") is not None:
-            if check_spike(conn, skin_id, mh, price["median_price"], threshold_pct, rolling_days):
-                alert_count += 1
-            if check_all_time_high(conn, skin_id, mh, price["median_price"]):
-                alert_count += 1
-
-        if price.get("volume") is not None:
-            if check_volume_surge(conn, skin_id, mh, price["volume"], rolling_days):
+            if check_sell_signal(conn, skin_id, mh, price["median_price"]):
                 alert_count += 1
 
     if close_after:
         conn.close()
-    log.info("Ingest complete. %d stored, %d alert(s).", stored, alert_count)
+    log.info("Ingest complete. %d stored, %d sell signal(s).", stored, alert_count)
     return {"stored": stored, "alerts": alert_count}
 
 
@@ -452,8 +514,8 @@ def _cmd_history(market_hash: str, limit: int) -> None:
     for fetched_at, lowest, median, volume in rows:
         print(
             f"{fetched_at[:19]:19}  "
-            f"{f'${lowest:.2f}' if lowest else 'N/A':>8}  "
-            f"{f'${median:.2f}' if median else 'N/A':>8}  "
+            f"{f'£{lowest:.2f}' if lowest else 'N/A':>8}  "
+            f"{f'£{median:.2f}' if median else 'N/A':>8}  "
             f"{volume or 'N/A':>8}"
         )
 
@@ -461,7 +523,7 @@ def _cmd_history(market_hash: str, limit: int) -> None:
 def _cmd_alerts(limit: int) -> None:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        """SELECT a.alerted_at, a.alert_type, s.market_hash, a.current, a.reference, a.pct_above
+        """SELECT a.alerted_at, a.alert_type, s.market_hash, a.current, a.reference, a.pct_above, a.reason
            FROM alerts a JOIN skins s ON s.id = a.skin_id
            ORDER BY a.alerted_at DESC LIMIT ?""",
         (limit,),
@@ -470,14 +532,12 @@ def _cmd_alerts(limit: int) -> None:
     if not rows:
         print("No alerts recorded.")
         return
-    print(f"\n{'Date':19}  {'Type':12}  {'Skin':40}  {'Current':>8}  {'Ref':>8}  {'%':>7}")
-    print("-" * 100)
-    for alerted_at, alert_type, mh, current, reference, pct in rows:
-        ref_str = f"${reference:.2f}" if reference else "N/A"
-        pct_str = f"{pct:.1f}%" if pct is not None else "N/A"
+    print(f"\n{'Date':19}  {'Type':12}  {'Skin':40}  {'Current':>8}  {'Reason'}")
+    print("-" * 110)
+    for alerted_at, alert_type, mh, current, reference, pct, reason in rows:
         print(
             f"{alerted_at[:19]:19}  {(alert_type or 'spike'):12}  {mh[:40]:40}  "
-            f"${current:>7.2f}  {ref_str:>8}  {pct_str:>7}"
+            f"£{current:>7.2f}  {reason or ''}"
         )
 
 
