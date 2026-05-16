@@ -1,4 +1,4 @@
-"""CS2 skin price tracker — core logic (used as a library by web.py)."""
+"""CS2 skin price tracker — core library and collect CLI."""
 
 import os
 import time
@@ -16,11 +16,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
-STEAM_ID = os.getenv("STEAM_ID", "")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
 
-INVENTORY_COMMUNITY_URL = "https://steamcommunity.com/inventory/{steam_id}/730/2"
-SCRAPERAPI_URL = "https://api.scraperapi.com/"
 PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
 
@@ -66,7 +62,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             pct_above   REAL
         );
     """)
-    # Schema migrations — safe to run repeatedly
     for sql in [
         "ALTER TABLE alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'spike'",
         "ALTER TABLE alerts ADD COLUMN reference REAL",
@@ -79,74 +74,35 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def get_inventory(steam_id: str) -> list[dict]:
-    if SCRAPERAPI_KEY:
-        return _inventory_via_scraper(steam_id)
-    return _inventory_via_community(steam_id)
-
-
-def _parse_assets_and_descriptions(assets: list, descriptions: list) -> list[dict]:
-    desc_map = {(d["classid"], d["instanceid"]): d for d in descriptions}
-    items = []
-    for asset in assets:
-        desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
-        if not desc.get("marketable"):
-            continue
-        items.append({
-            "market_hash": desc["market_hash_name"],
-            "name": desc.get("name", desc["market_hash_name"]),
-        })
-    return items
-
-
-def _inventory_via_scraper(steam_id: str) -> list[dict]:
-    """Route Steam community inventory through ScraperAPI to bypass datacenter IP blocks."""
-    target = (
-        f"https://steamcommunity.com/inventory/{steam_id}/730/2"
-        "?l=english&count=5000"
-    )
-    resp = requests.get(
-        SCRAPERAPI_URL,
-        params={"api_key": SCRAPERAPI_KEY, "url": target},
-        timeout=60,  # ScraperAPI can take longer than a direct request
-    )
-    log.info("Inventory via ScraperAPI: HTTP %d", resp.status_code)
-    if resp.status_code in (400, 403):
-        raise RuntimeError(
-            f"ScraperAPI inventory returned {resp.status_code} — "
-            "check SCRAPERAPI_KEY and Steam inventory privacy settings."
-        )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Inventory response not successful: {data}")
-
-    items = _parse_assets_and_descriptions(data.get("assets", []), data.get("descriptions", []))
-    log.info("Found %d marketable items via ScraperAPI", len(items))
-    return items
-
-
-def _inventory_via_community(steam_id: str) -> list[dict]:
-    """Direct community endpoint — works locally, blocked from datacenter IPs."""
-    url = INVENTORY_COMMUNITY_URL.format(steam_id=steam_id)
+    url = f"https://steamcommunity.com/inventory/{steam_id}/730/2"
     resp = requests.get(
         url,
         params={"l": "english", "count": 5000},
         headers=HEADERS,
         timeout=30,
     )
-    log.info("Inventory community: HTTP %d", resp.status_code)
-    if resp.status_code in (400, 403):
-        raise RuntimeError(
-            f"Steam community inventory returned {resp.status_code}. "
-            "Set SCRAPERAPI_KEY to proxy requests when running on a server."
-        )
+    log.info("Inventory: HTTP %d", resp.status_code)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success"):
         raise RuntimeError(f"Inventory fetch failed: {data}")
 
-    items = _parse_assets_and_descriptions(data.get("assets", []), data.get("descriptions", []))
-    log.info("Found %d marketable items via community endpoint", len(items))
+    desc_map = {
+        (d["classid"], d["instanceid"]): d
+        for d in data.get("descriptions", [])
+    }
+    items = []
+    seen: set[str] = set()
+    for asset in data.get("assets", []):
+        desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
+        if not desc.get("marketable"):
+            continue
+        mh = desc["market_hash_name"]
+        if mh not in seen:
+            seen.add(mh)
+            items.append({"market_hash": mh, "name": desc.get("name", mh)})
+
+    log.info("Found %d unique marketable items", len(items))
     return items
 
 
@@ -160,7 +116,6 @@ def fetch_price(market_hash: str) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
-            log.warning("No price data for %s", market_hash)
             return None
 
         def parse_usd(s: str | None) -> float | None:
@@ -289,70 +244,85 @@ def check_volume_surge(
     return True
 
 
-def run(
-    steam_id: str,
-    threshold_pct: float,
-    rolling_days: int,
-    dry_run: bool = False,
-) -> dict:
-    """Run a full tracking cycle. Returns a summary dict."""
+def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
+    """Store prices and run detection. Used by /api/ingest and local runs."""
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    items = get_inventory(steam_id)
-    if not items:
-        log.info("No marketable items found — nothing to do")
-        conn.close()
-        return {"items": 0, "prices_fetched": 0, "alerts": 0}
-
-    seen_hashes: set[str] = set()
-    unique_items = []
-    for item in items:
-        if item["market_hash"] not in seen_hashes:
-            seen_hashes.add(item["market_hash"])
-            unique_items.append(item)
-
-    log.info("Fetching prices for %d unique skins", len(unique_items))
-    prices_fetched = 0
+    stored = 0
     alert_count = 0
 
-    for i, item in enumerate(unique_items):
+    for item in items:
         mh = item["market_hash"]
-        price = fetch_price(mh)
+        price = item.get("price")
+        if not price:
+            continue
 
-        if price is None:
-            log.info("[%d/%d] %s — no price", i + 1, len(unique_items), mh)
-        else:
+        skin_id = upsert_skin(conn, mh)
+        record_price(conn, skin_id, price)
+        stored += 1
+
+        if price.get("median_price") is not None:
+            if check_spike(conn, skin_id, mh, price["median_price"], threshold_pct, rolling_days):
+                alert_count += 1
+            if check_all_time_high(conn, skin_id, mh, price["median_price"]):
+                alert_count += 1
+
+        if price.get("volume") is not None:
+            if check_volume_surge(conn, skin_id, mh, price["volume"], rolling_days):
+                alert_count += 1
+
+    conn.close()
+    log.info("Ingest complete. %d stored, %d alert(s).", stored, alert_count)
+    return {"stored": stored, "alerts": alert_count}
+
+
+def collect(
+    steam_id: str,
+    push_url: str,
+    push_token: str,
+    threshold_pct: float,
+    rolling_days: int,
+) -> None:
+    """Fetch inventory + prices then POST to Fly.io /api/ingest."""
+    items = get_inventory(steam_id)
+    if not items:
+        log.info("No marketable items — nothing to collect")
+        return
+
+    payload_items = []
+    for i, item in enumerate(items):
+        price = fetch_price(item["market_hash"])
+        if price:
+            payload_items.append({"market_hash": item["market_hash"], "price": price})
             log.info(
-                "[%d/%d] %s  lowest=$%s  median=$%s  vol=%s",
-                i + 1, len(unique_items), mh,
-                price["lowest_price"], price["median_price"], price["volume"],
+                "[%d/%d] %s  median=$%s  vol=%s",
+                i + 1, len(items), item["market_hash"],
+                price["median_price"], price["volume"],
             )
-            prices_fetched += 1
+        else:
+            log.info("[%d/%d] %s — no price", i + 1, len(items), item["market_hash"])
 
-            if not dry_run:
-                skin_id = upsert_skin(conn, mh)
-                record_price(conn, skin_id, price)
-
-                if price["median_price"] is not None:
-                    if check_spike(conn, skin_id, mh, price["median_price"], threshold_pct, rolling_days):
-                        alert_count += 1
-                    if check_all_time_high(conn, skin_id, mh, price["median_price"]):
-                        alert_count += 1
-
-                if price["volume"] is not None:
-                    if check_volume_surge(conn, skin_id, mh, price["volume"], rolling_days):
-                        alert_count += 1
-
-        if i < len(unique_items) - 1:
+        if i < len(items) - 1:
             time.sleep(PRICE_FETCH_DELAY)
 
-    log.info("Done. %d prices fetched, %d alert(s) fired.", prices_fetched, alert_count)
-    conn.close()
-    return {"items": len(unique_items), "prices_fetched": prices_fetched, "alerts": alert_count}
+    payload = {
+        "items": payload_items,
+        "threshold_pct": threshold_pct,
+        "rolling_days": rolling_days,
+    }
+    resp = requests.post(
+        push_url,
+        json=payload,
+        headers={"Authorization": f"Bearer {push_token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    log.info("Ingest response: %s", result)
 
 
-# ── CLI (for local use / debugging) ─────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _cmd_history(market_hash: str, limit: int) -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -406,11 +376,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CS2 skin price tracker")
     sub = parser.add_subparsers(dest="cmd")
 
-    run_p = sub.add_parser("run", help="Fetch inventory + prices and detect signals")
-    run_p.add_argument("--steam-id", default=STEAM_ID)
-    run_p.add_argument("--threshold", type=float, default=20.0)
-    run_p.add_argument("--days", type=int, default=7)
-    run_p.add_argument("--dry-run", action="store_true")
+    collect_p = sub.add_parser("collect", help="Fetch inventory+prices and POST to ingest URL")
+    collect_p.add_argument("--steam-id", required=True)
+    collect_p.add_argument("--push-url", required=True, help="URL of /api/ingest on Fly.io")
+    collect_p.add_argument("--push-token", required=True, help="INGEST_TOKEN secret")
+    collect_p.add_argument("--threshold", type=float, default=20.0)
+    collect_p.add_argument("--days", type=int, default=7)
 
     hist_p = sub.add_parser("history", help="Show price history for a skin")
     hist_p.add_argument("market_hash")
@@ -421,10 +392,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "run":
-        if not args.steam_id:
-            parser.error("Provide --steam-id or set STEAM_ID env var")
-        run(args.steam_id, args.threshold, args.days, args.dry_run)
+    if args.cmd == "collect":
+        collect(args.steam_id, args.push_url, args.push_token, args.threshold, args.days)
     elif args.cmd == "history":
         _cmd_history(args.market_hash, args.limit)
     elif args.cmd == "alerts":
