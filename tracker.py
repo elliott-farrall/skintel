@@ -254,6 +254,9 @@ def rolling_average(conn: sqlite3.Connection, skin_id: int, days: int) -> float 
     return row[0] if row else None
 
 
+_dm_channel_id: str | None = None
+
+
 def _send_discord_alert(
     market_hash: str,
     alert_type: str,
@@ -262,6 +265,7 @@ def _send_discord_alert(
     pct_above: float | None,
     image_url: str | None = None,
 ) -> None:
+    global _dm_channel_id
     if not DISCORD_BOT_TOKEN or not DISCORD_USER_ID:
         return
 
@@ -286,26 +290,36 @@ def _send_discord_alert(
 
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
     try:
-        # Open (or retrieve) DM channel with the user
-        dm = requests.post(
-            "https://discord.com/api/v10/users/@me/channels",
-            json={"recipient_id": DISCORD_USER_ID},
-            headers=headers,
-            timeout=10,
-        )
-        dm.raise_for_status()
-        channel_id = dm.json()["id"]
+        if _dm_channel_id is None:
+            dm = requests.post(
+                "https://discord.com/api/v10/users/@me/channels",
+                json={"recipient_id": DISCORD_USER_ID},
+                headers=headers,
+                timeout=10,
+            )
+            dm.raise_for_status()
+            _dm_channel_id = dm.json()["id"]
 
-        msg = requests.post(
-            f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            json={"embeds": [embed]},
-            headers=headers,
-            timeout=10,
-        )
-        if msg.status_code not in (200, 201):
-            log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
+        for attempt in range(2):
+            msg = requests.post(
+                f"https://discord.com/api/v10/channels/{_dm_channel_id}/messages",
+                json={"embeds": [embed]},
+                headers=headers,
+                timeout=10,
+            )
+            if msg.status_code == 429:
+                retry_after = float(msg.json().get("retry_after", 5))
+                log.warning("Discord rate limited — waiting %.1fs", retry_after)
+                time.sleep(retry_after)
+                continue
+            if msg.status_code not in (200, 201):
+                log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
+            break
     except Exception as exc:
         log.warning("Discord DM failed: %s", exc)
+
+
+ALERT_COOLDOWN_HOURS = 24
 
 
 def _insert_alert(
@@ -316,6 +330,17 @@ def _insert_alert(
     reference: float | None,
     pct_above: float | None,
 ) -> None:
+    # Suppress if same skin+type alerted within the cooldown window
+    recent = conn.execute(
+        """SELECT 1 FROM alerts
+           WHERE skin_id = ? AND alert_type = ?
+             AND alerted_at >= datetime('now', ?)
+           LIMIT 1""",
+        (skin_id, alert_type, f"-{ALERT_COOLDOWN_HOURS} hours"),
+    ).fetchone()
+    if recent:
+        return
+
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO alerts (skin_id, alerted_at, alert_type, current, reference, pct_above)
