@@ -96,11 +96,19 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
         resp.raise_for_status()
         data = resp.json().get("response", {})
 
+        assets = data.get("assets", [])
+        descriptions = data.get("descriptions", [])
+        log.info("assets=%d descriptions=%d total_inventory_count=%s",
+                 len(assets), len(descriptions), data.get("total_inventory_count"))
+        if descriptions:
+            sample = descriptions[0]
+            log.info("sample desc keys=%s marketable=%r", list(sample.keys()), sample.get("marketable"))
+
         desc_map = {
             (d["classid"], d["instanceid"]): d
-            for d in data.get("descriptions", [])
+            for d in descriptions
         }
-        for asset in data.get("assets", []):
+        for asset in assets:
             desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
             if not desc.get("marketable"):
                 continue
