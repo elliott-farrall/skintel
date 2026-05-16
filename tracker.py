@@ -1,12 +1,14 @@
-"""CS2 skin price tracker — core library and collect CLI."""
+"""CS2 skin price tracker — core library."""
 
 import os
+import re
 import time
 import sqlite3
 import logging
 import argparse
-import requests
 from datetime import datetime, timezone
+
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,23 +18,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_USER_ID   = os.getenv("DISCORD_USER_ID", "")
 
-PRICE_URL = "https://steamcommunity.com/market/priceoverview/"
 APPID = 730
-
-PRICE_FETCH_DELAY = 3.5  # Steam market: ~20 req/min unauthenticated
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
 VOLUME_SURGE_MULT = 2.0  # alert if volume >= 2x rolling average
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://steamcommunity.com/",
+ALERT_COLORS = {
+    "spike":        0xC084FC,  # purple
+    "all_time_high": 0xF87171, # red
+    "volume_surge": 0xFB923C,  # orange
+}
+ALERT_LABELS = {
+    "spike":        "Price Spike",
+    "all_time_high": "All-Time High",
+    "volume_surge": "Volume Surge",
 }
 
 
@@ -65,6 +66,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     for sql in [
         "ALTER TABLE alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'spike'",
         "ALTER TABLE alerts ADD COLUMN reference REAL",
+        "ALTER TABLE skins ADD COLUMN image_url TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -85,7 +87,6 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
     resp.raise_for_status()
     raw = resp.json()
 
-    # Response is either a list of items or {"items": [...]}
     entries = raw if isinstance(raw, list) else raw.get("items", raw.get("data", []))
     if entries and not isinstance(entries, list):
         log.warning("Unexpected response shape: %s", list(raw.keys()) if isinstance(raw, dict) else type(raw))
@@ -113,49 +114,118 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
                 return None
 
         price = {
-            "lowest_price":  _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
-            "median_price":  _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
-            "volume":        entry.get("volume") or entry.get("pricesold"),
+            "lowest_price": _price(entry.get("pricemin") or entry.get("pricelowest") or entry.get("price_lowest")),
+            "median_price": _price(entry.get("priceavg") or entry.get("pricemedian") or entry.get("price") or entry.get("price_avg")),
+            "volume":       entry.get("volume") or entry.get("pricesold"),
         }
-        items.append({"market_hash": mh, "name": entry.get("name", mh), "price": price})
+        image_url = (
+            entry.get("image")
+            or entry.get("icon_url")
+            or entry.get("image_url")
+            or entry.get("icon")
+        )
+        items.append({
+            "market_hash": mh,
+            "name": entry.get("name", mh),
+            "price": price,
+            "image_url": image_url,
+        })
 
     log.info("Found %d unique marketable items", len(items))
     return items
 
 
-def fetch_price(market_hash: str) -> dict | None:
-    params = {"appid": APPID, "market_hash_name": market_hash, "currency": 1}
-    try:
-        resp = requests.get(PRICE_URL, params=params, headers=HEADERS, timeout=15)
-        if resp.status_code == 429:
-            log.warning("Rate limited fetching %s — skipping", market_hash)
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("success"):
-            return None
+def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
+    """Fetch up to 365 days of price history for one item."""
+    url = "https://api.steamwebapi.com/steam/api/pricehistory"
+    resp = requests.get(
+        url,
+        params={"key": api_key, "market_hash_name": market_hash, "appid": APPID},
+        timeout=30,
+    )
+    if resp.status_code == 429:
+        log.warning("Rate limited on history for %s", market_hash)
+        return []
+    resp.raise_for_status()
+    data = resp.json()
 
-        def parse_usd(s: str | None) -> float | None:
-            if not s:
-                return None
-            return float(s.replace("$", "").replace(",", "").strip())
+    raw_prices = data if isinstance(data, list) else data.get("prices", [])
+    if not raw_prices:
+        return []
 
-        return {
-            "lowest_price": parse_usd(data.get("lowest_price")),
-            "median_price": parse_usd(data.get("median_price")),
-            "volume": int(data["volume"].replace(",", "")) if data.get("volume") else None,
-        }
-    except Exception as exc:
-        log.warning("Price fetch error for %s: %s", market_hash, exc)
-        return None
+    rows = []
+    for entry in raw_prices:
+        try:
+            date_str, price_val, vol_str = entry[0], entry[1], entry[2]
+            # "Nov 27 2013 01:+0" → parse just the date portion
+            m = re.match(r"(\w+ \d+ \d+)", str(date_str))
+            if not m:
+                continue
+            dt = datetime.strptime(m.group(1), "%b %d %Y").replace(
+                hour=12, tzinfo=timezone.utc
+            )
+            rows.append({
+                "fetched_at": dt.isoformat(),
+                "median_price": float(price_val) if price_val else None,
+                "lowest_price": None,
+                "volume": int(vol_str) if vol_str else None,
+            })
+        except Exception:
+            continue
+    return rows
 
 
-def upsert_skin(conn: sqlite3.Connection, market_hash: str) -> int:
+def backfill_history(conn: sqlite3.Connection, api_key: str) -> dict:
+    """Fetch historical prices for all tracked skins and insert missing rows."""
+    skins = conn.execute("SELECT id, market_hash FROM skins").fetchall()
+    total_inserted = 0
+
+    for skin_id, market_hash in skins:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM prices WHERE skin_id = ?", (skin_id,)
+        ).fetchone()[0]
+
+        if existing >= 30:
+            log.info("Skipping backfill for %s — already has %d rows", market_hash, existing)
+            continue
+
+        log.info("Backfilling %s", market_hash)
+        try:
+            rows = fetch_price_history(market_hash, api_key)
+        except Exception as exc:
+            log.warning("History fetch failed for %s: %s", market_hash, exc)
+            rows = []
+
+        inserted = 0
+        for row in rows:
+            try:
+                conn.execute(
+                    """INSERT INTO prices (skin_id, fetched_at, lowest_price, median_price, volume)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (skin_id, row["fetched_at"], row["lowest_price"], row["median_price"], row["volume"]),
+                )
+                inserted += 1
+            except Exception:
+                continue
+        conn.commit()
+        total_inserted += inserted
+        log.info("  inserted %d rows for %s", inserted, market_hash)
+        time.sleep(0.5)
+
+    return {"skins": len(skins), "inserted": total_inserted}
+
+
+def upsert_skin(conn: sqlite3.Connection, market_hash: str, image_url: str | None = None) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT OR IGNORE INTO skins (market_hash, first_seen) VALUES (?, ?)",
         (market_hash, now),
     )
+    if image_url:
+        conn.execute(
+            "UPDATE skins SET image_url = ? WHERE market_hash = ? AND (image_url IS NULL OR image_url != ?)",
+            (image_url, market_hash, image_url),
+        )
     conn.commit()
     return conn.execute(
         "SELECT id FROM skins WHERE market_hash = ?", (market_hash,)
@@ -182,6 +252,60 @@ def rolling_average(conn: sqlite3.Connection, skin_id: int, days: int) -> float 
     return row[0] if row else None
 
 
+def _send_discord_alert(
+    market_hash: str,
+    alert_type: str,
+    current: float,
+    reference: float | None,
+    pct_above: float | None,
+    image_url: str | None = None,
+) -> None:
+    if not DISCORD_BOT_TOKEN or not DISCORD_USER_ID:
+        return
+
+    label = ALERT_LABELS.get(alert_type, alert_type.replace("_", " ").title())
+    color = ALERT_COLORS.get(alert_type, 0x4ADE80)
+
+    fields = [{"name": "Current price", "value": f"${current:.2f}", "inline": True}]
+    if reference is not None:
+        fields.append({"name": "Reference", "value": f"${reference:.2f}", "inline": True})
+    if pct_above is not None:
+        sign = "+" if pct_above >= 0 else ""
+        fields.append({"name": "Change", "value": f"{sign}{pct_above:.1f}%", "inline": True})
+
+    embed: dict = {
+        "title": f"{label}: {market_hash}",
+        "color": color,
+        "fields": fields,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    try:
+        # Open (or retrieve) DM channel with the user
+        dm = requests.post(
+            "https://discord.com/api/v10/users/@me/channels",
+            json={"recipient_id": DISCORD_USER_ID},
+            headers=headers,
+            timeout=10,
+        )
+        dm.raise_for_status()
+        channel_id = dm.json()["id"]
+
+        msg = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            json={"embeds": [embed]},
+            headers=headers,
+            timeout=10,
+        )
+        if msg.status_code not in (200, 201):
+            log.warning("Discord DM returned %d: %s", msg.status_code, msg.text[:200])
+    except Exception as exc:
+        log.warning("Discord DM failed: %s", exc)
+
+
 def _insert_alert(
     conn: sqlite3.Connection,
     skin_id: int,
@@ -197,6 +321,10 @@ def _insert_alert(
         (skin_id, now, alert_type, current, reference, pct_above),
     )
     conn.commit()
+
+    row = conn.execute("SELECT market_hash, image_url FROM skins WHERE id = ?", (skin_id,)).fetchone()
+    if row:
+        _send_discord_alert(row[0], alert_type, current, reference, pct_above, row[1])
 
 
 def check_spike(
@@ -282,7 +410,7 @@ def ingest(
         if not price:
             continue
 
-        skin_id = upsert_skin(conn, mh)
+        skin_id = upsert_skin(conn, mh, item.get("image_url"))
         record_price(conn, skin_id, price)
         stored += 1
 
@@ -302,48 +430,7 @@ def ingest(
     return {"stored": stored, "alerts": alert_count}
 
 
-def collect(
-    steam_id: str,
-    api_key: str,
-    push_url: str,
-    push_token: str,
-    threshold_pct: float,
-    rolling_days: int,
-) -> None:
-    """Fetch inventory + prices then POST to Fly.io /api/ingest."""
-    items = get_inventory(steam_id, api_key)
-    if not items:
-        log.info("No marketable items — nothing to collect")
-        return
-
-    payload_items = []
-    for i, item in enumerate(items):
-        price = item.get("price") or {}
-        if price.get("median_price") is not None or price.get("lowest_price") is not None:
-            payload_items.append({"market_hash": item["market_hash"], "price": price})
-            log.info("[%d/%d] %s  median=$%s  vol=%s",
-                     i + 1, len(items), item["market_hash"],
-                     price.get("median_price"), price.get("volume"))
-        else:
-            log.info("[%d/%d] %s — no price", i + 1, len(items), item["market_hash"])
-
-    payload = {
-        "items": payload_items,
-        "threshold_pct": threshold_pct,
-        "rolling_days": rolling_days,
-    }
-    resp = requests.post(
-        push_url,
-        json=payload,
-        headers={"Authorization": f"Bearer {push_token}"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    log.info("Ingest response: %s", result)
-
-
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── CLI (local debugging only) ────────────────────────────────────────────────
 
 def _cmd_history(market_hash: str, limit: int) -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -397,14 +484,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CS2 skin price tracker")
     sub = parser.add_subparsers(dest="cmd")
 
-    collect_p = sub.add_parser("collect", help="Fetch inventory+prices and POST to ingest URL")
-    collect_p.add_argument("--steam-id", required=True)
-    collect_p.add_argument("--api-key", required=True, help="steamwebapi.com API key")
-    collect_p.add_argument("--push-url", required=True, help="URL of /api/ingest on Fly.io")
-    collect_p.add_argument("--push-token", required=True, help="INGEST_TOKEN secret")
-    collect_p.add_argument("--threshold", type=float, default=20.0)
-    collect_p.add_argument("--days", type=int, default=7)
-
     hist_p = sub.add_parser("history", help="Show price history for a skin")
     hist_p.add_argument("market_hash")
     hist_p.add_argument("--limit", type=int, default=30)
@@ -414,9 +493,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "collect":
-        collect(args.steam_id, args.api_key, args.push_url, args.push_token, args.threshold, args.days)
-    elif args.cmd == "history":
+    if args.cmd == "history":
         _cmd_history(args.market_hash, args.limit)
     elif args.cmd == "alerts":
         _cmd_alerts(args.limit)
