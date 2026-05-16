@@ -73,34 +73,46 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def get_inventory(steam_id: str) -> list[dict]:
-    url = f"https://steamcommunity.com/inventory/{steam_id}/730/2"
-    resp = requests.get(
-        url,
-        params={"l": "english", "count": 5000},
-        headers=HEADERS,
-        timeout=30,
-    )
-    log.info("Inventory: HTTP %d", resp.status_code)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Inventory fetch failed: {data}")
-
-    desc_map = {
-        (d["classid"], d["instanceid"]): d
-        for d in data.get("descriptions", [])
-    }
+def get_inventory(steam_id: str, api_key: str) -> list[dict]:
+    url = "https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/"
     items = []
     seen: set[str] = set()
-    for asset in data.get("assets", []):
-        desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
-        if not desc.get("marketable"):
-            continue
-        mh = desc["market_hash_name"]
-        if mh not in seen:
-            seen.add(mh)
-            items.append({"market_hash": mh, "name": desc.get("name", mh)})
+    start_assetid = None
+
+    while True:
+        params = {
+            "key": api_key,
+            "steamid": steam_id,
+            "appid": APPID,
+            "contextid": 2,
+            "count": 5000,
+            "language": "english",
+        }
+        if start_assetid:
+            params["start_assetid"] = start_assetid
+
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        log.info("Inventory page: HTTP %d", resp.status_code)
+        resp.raise_for_status()
+        data = resp.json().get("response", {})
+
+        desc_map = {
+            (d["classid"], d["instanceid"]): d
+            for d in data.get("descriptions", [])
+        }
+        for asset in data.get("assets", []):
+            desc = desc_map.get((asset["classid"], asset["instanceid"]), {})
+            if not desc.get("marketable"):
+                continue
+            mh = desc["market_hash_name"]
+            if mh not in seen:
+                seen.add(mh)
+                items.append({"market_hash": mh, "name": desc.get("name", mh)})
+
+        if data.get("more_items"):
+            start_assetid = data.get("last_assetid")
+        else:
+            break
 
     log.info("Found %d unique marketable items", len(items))
     return items
@@ -279,13 +291,14 @@ def ingest(items: list[dict], threshold_pct: float, rolling_days: int) -> dict:
 
 def collect(
     steam_id: str,
+    api_key: str,
     push_url: str,
     push_token: str,
     threshold_pct: float,
     rolling_days: int,
 ) -> None:
     """Fetch inventory + prices then POST to Fly.io /api/ingest."""
-    items = get_inventory(steam_id)
+    items = get_inventory(steam_id, api_key)
     if not items:
         log.info("No marketable items — nothing to collect")
         return
@@ -378,6 +391,7 @@ def main() -> None:
 
     collect_p = sub.add_parser("collect", help="Fetch inventory+prices and POST to ingest URL")
     collect_p.add_argument("--steam-id", required=True)
+    collect_p.add_argument("--api-key", required=True, help="Steam Web API key")
     collect_p.add_argument("--push-url", required=True, help="URL of /api/ingest on Fly.io")
     collect_p.add_argument("--push-token", required=True, help="INGEST_TOKEN secret")
     collect_p.add_argument("--threshold", type=float, default=20.0)
@@ -393,7 +407,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "collect":
-        collect(args.steam_id, args.push_url, args.push_token, args.threshold, args.days)
+        collect(args.steam_id, args.api_key, args.push_url, args.push_token, args.threshold, args.days)
     elif args.cmd == "history":
         _cmd_history(args.market_hash, args.limit)
     elif args.cmd == "alerts":
