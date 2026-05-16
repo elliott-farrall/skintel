@@ -39,9 +39,33 @@ def require_auth(f):
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(tr.DB_PATH)
+    conn = tr.connect()
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _compute_stats(history: list[dict], current: float | None) -> dict:
+    """Static signals derived from the 30-point history (oldest → newest)."""
+    prices = [h["median_price"] for h in history if h["median_price"] is not None]
+    if current is None or len(prices) < 5:
+        return {}
+
+    ath = max(prices)
+    avg_all = sum(prices) / len(prices)
+
+    recent_n = min(5, len(prices) // 2)
+    recent = prices[-recent_n:]
+    older = prices[:-recent_n] or recent
+    avg_recent = sum(recent) / len(recent)
+    avg_older = sum(older) / len(older)
+
+    return {
+        "ath": ath,
+        "pct_vs_ath": (current - ath) / ath * 100,
+        "pct_vs_avg": (current - avg_all) / avg_all * 100,
+        "recent_change_pct": (avg_recent - avg_older) / avg_older * 100 if avg_older else 0.0,
+        "at_ath": current >= ath * 0.97,
+    }
 
 
 def run_collect() -> None:
@@ -57,7 +81,7 @@ def run_collect() -> None:
             {"market_hash": i["market_hash"], "price": i["price"], "image_url": i.get("image_url")}
             for i in items if i.get("price")
         ]
-        conn = sqlite3.connect(tr.DB_PATH)
+        conn = tr.connect()
         tr.init_db(conn)
         tr.ingest(payload, conn=conn)
         conn.close()
@@ -72,7 +96,7 @@ def run_backfill() -> None:
         log.info("Backfill already running — skipping")
         return
     try:
-        conn = sqlite3.connect(tr.DB_PATH)
+        conn = tr.connect()
         tr.init_db(conn)
         result = tr.backfill_history(conn)
         conn.close()
@@ -95,7 +119,7 @@ def api_skins():
     conn = get_db()
 
     skins = conn.execute("""
-        SELECT s.id, s.market_hash, s.image_url,
+        SELECT s.id, s.market_hash, s.image_url, s.rarity_color,
                p.lowest_price, p.median_price, p.volume, p.fetched_at
         FROM skins s
         LEFT JOIN prices p ON p.id = (
@@ -143,19 +167,28 @@ def api_skins():
     result = []
     for s in skins:
         sid = s["id"]
+        history = history_by_skin.get(sid, [])
+        stats = _compute_stats(history, s["median_price"])
         result.append({
             "id": sid,
             "market_hash": s["market_hash"],
             "image_url": s["image_url"],
+            "rarity_color": s["rarity_color"],
             "lowest_price": s["lowest_price"],
             "median_price": s["median_price"],
             "volume": s["volume"],
             "fetched_at": s["fetched_at"],
             "alerts": alerts_by_skin.get(sid, []),
-            "history": history_by_skin.get(sid, []),
+            "history": history,
+            "stats": stats,
         })
 
-    result.sort(key=lambda x: (-len(x["alerts"]), -(x["median_price"] or 0)))
+    # Order: AI sell-signal alerts first, then by recent momentum desc, then price desc
+    result.sort(key=lambda x: (
+        0 if x["alerts"] else 1,
+        -(x["stats"].get("recent_change_pct", 0) or 0),
+        -(x["median_price"] or 0),
+    ))
     return jsonify(result)
 
 
@@ -212,7 +245,7 @@ def _startup() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    conn = sqlite3.connect(tr.DB_PATH)
+    conn = tr.connect()
     tr.init_db(conn)
     conn.close()
 

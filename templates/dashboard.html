@@ -170,7 +170,10 @@
       border-radius: 4px;
     }
 
-    .badge-sell   { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .badge-sell    { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .badge-ath     { background: #450a0a; color: #f87171; border: 1px solid #991b1b; }
+    .badge-rising  { background: #431407; color: #fb923c; border: 1px solid #9a3412; }
+    .badge-falling { background: #172554; color: #93c5fd; border: 1px solid #1e40af; }
 
     .card-footer {
       display: flex;
@@ -254,7 +257,7 @@ async function load() {
   const timestamps = skins.map(s => s.fetched_at).filter(Boolean);
   const latest = timestamps.sort().at(-1);
   document.getElementById("meta").textContent = latest
-    ? `Last updated ${new Date(latest + "Z").toLocaleString()}`
+    ? `Last updated ${new Date(latest).toLocaleString()}`
     : "No price data yet";
 
   const grid = document.getElementById("grid");
@@ -279,10 +282,21 @@ function buildCard(skin) {
   const median  = skin.median_price  != null ? `£${skin.median_price.toFixed(2)}`  : "—";
   const lowest  = skin.lowest_price  != null ? `£${skin.lowest_price.toFixed(2)}`  : "—";
 
-  const badgesHtml = alertTypes.map(t => {
-    if (t === "sell_signal")  return `<span class="badge badge-sell">Sell</span>`;
-    return "";
-  }).join("");
+  const badges = [];
+  if (alertTypes.includes("sell_signal")) {
+    badges.push(`<span class="badge badge-sell">Sell</span>`);
+  }
+  const stats = skin.stats || {};
+  if (stats.at_ath) {
+    badges.push(`<span class="badge badge-ath">ATH</span>`);
+  }
+  const change = stats.recent_change_pct;
+  if (typeof change === "number" && change >= 10) {
+    badges.push(`<span class="badge badge-rising">↑ ${change.toFixed(1)}%</span>`);
+  } else if (typeof change === "number" && change <= -10) {
+    badges.push(`<span class="badge badge-falling">↓ ${Math.abs(change).toFixed(1)}%</span>`);
+  }
+  const badgesHtml = badges.join("");
 
   const inventoryUrl =
     `https://steamcommunity.com/profiles/${STEAM_ID}/inventory/#730`;
@@ -291,10 +305,13 @@ function buildCard(skin) {
     ? `<img class="item-img" src="${esc(skin.image_url)}" alt="" loading="lazy">`
     : `<div class="item-img-placeholder"></div>`;
 
+  const safeColor = /^[0-9a-fA-F]{6}$/.test(skin.rarity_color || "") ? skin.rarity_color : null;
+  const nameStyle = safeColor ? ` style="color: #${safeColor}"` : "";
+
   card.innerHTML = `
     <div class="card-header">
       ${imgHtml}
-      <div class="card-name" title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
+      <div class="card-name"${nameStyle} title="${esc(skin.market_hash)}">${esc(skin.market_hash)}</div>
     </div>
     <div class="prices">
       <div class="price-block">
