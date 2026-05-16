@@ -21,7 +21,6 @@ SCHEDULE_HOURS   = int(os.getenv("SCHEDULE_HOURS", "6"))
 
 app = Flask(__name__)
 _run_lock = threading.Lock()
-_backfill_lock = threading.Lock()
 
 
 def require_auth(f):
@@ -59,11 +58,13 @@ def _compute_stats(history: list[dict], current: float | None) -> dict:
     avg_recent = sum(recent) / len(recent)
     avg_older = sum(older) / len(older)
 
+    recent_change_pct = (avg_recent - avg_older) / avg_older * 100 if avg_older else 0.0
     return {
         "ath": ath,
         "pct_vs_ath": (current - ath) / ath * 100,
         "pct_vs_avg": (current - avg_all) / avg_all * 100,
-        "recent_change_pct": (avg_recent - avg_older) / avg_older * 100 if avg_older else 0.0,
+        "recent_change_pct": recent_change_pct,
+        "momentum_score": recent_change_pct * current,
         "at_ath": current >= ath * 0.97,
     }
 
@@ -78,33 +79,25 @@ def run_collect() -> None:
             log.info("No marketable items — nothing to ingest")
             return
         payload = [
-            {"market_hash": i["market_hash"], "price": i["price"], "image_url": i.get("image_url")}
+            {
+                "market_hash": i["market_hash"],
+                "price": i["price"],
+                "image_url": i.get("image_url"),
+                "rarity_color": i.get("rarity_color"),
+            }
             for i in items if i.get("price")
         ]
         conn = tr.connect()
-        tr.init_db(conn)
-        tr.ingest(payload, conn=conn)
-        conn.close()
+        try:
+            tr.init_db(conn)
+            tr.ingest(payload, conn=conn)
+            tr.backfill_history(conn)
+        finally:
+            conn.close()
     except Exception:
         log.exception("Collect failed")
     finally:
         _run_lock.release()
-
-
-def run_backfill() -> None:
-    if not _backfill_lock.acquire(blocking=False):
-        log.info("Backfill already running — skipping")
-        return
-    try:
-        conn = tr.connect()
-        tr.init_db(conn)
-        result = tr.backfill_history(conn)
-        conn.close()
-        log.info("Backfill complete: %s", result)
-    except Exception:
-        log.exception("Backfill failed")
-    finally:
-        _backfill_lock.release()
 
 
 @app.route("/")
@@ -186,7 +179,7 @@ def api_skins():
     # Order: AI sell-signal alerts first, then by recent momentum desc, then price desc
     result.sort(key=lambda x: (
         0 if x["alerts"] else 1,
-        -(x["stats"].get("recent_change_pct", 0) or 0),
+        -(x["stats"].get("momentum_score", 0) or 0),
         -(x["median_price"] or 0),
     ))
     return jsonify(result)
@@ -216,16 +209,6 @@ def api_run():
     return jsonify({"status": "started"})
 
 
-@app.route("/api/backfill", methods=["POST"])
-@require_auth
-def api_backfill():
-    if _backfill_lock.locked():
-        return jsonify({"status": "already_running"})
-    t = threading.Thread(target=run_backfill, daemon=True)
-    t.start()
-    return jsonify({"status": "started"})
-
-
 @app.route("/api/status")
 @require_auth
 def api_status():
@@ -235,7 +218,6 @@ def api_status():
     return jsonify({
         "last_run": row["last_run"] if row else None,
         "running": _run_lock.locked(),
-        "backfilling": _backfill_lock.locked(),
     })
 
 

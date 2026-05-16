@@ -100,6 +100,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             average     REAL,
             pct_above   REAL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_prices_skin_fetched
+            ON prices(skin_id, fetched_at);
     """)
     for sql in [
         "ALTER TABLE alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'spike'",
@@ -168,13 +171,23 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
             or entry.get("icon")
         )
         rarity_color = (
-            entry.get("color")
-            or entry.get("rarity_color")
+            entry.get("rarity_color")
+            or entry.get("rarityColor")
             or entry.get("raritycolor")
+            or entry.get("color")
             or entry.get("qualitycolor")
+            or entry.get("tag_rarity_color")
         )
+        # Steam standard format: tags array with category="Rarity"
+        if not rarity_color:
+            for tag in (entry.get("tags") or []):
+                if isinstance(tag, dict) and tag.get("category") == "Rarity":
+                    rarity_color = tag.get("color")
+                    break
         if rarity_color:
             rarity_color = str(rarity_color).lstrip("#").lower()
+            if not rarity_color or len(rarity_color) not in (3, 6):
+                rarity_color = None
 
         items.append({
             "market_hash": mh,
