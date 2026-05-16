@@ -137,7 +137,7 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
 
 def fetch_price_history(market_hash: str, api_key: str) -> list[dict]:
     """Fetch up to 365 days of price history for one item."""
-    url = "https://api.steamwebapi.com/steam/api/pricehistory"
+    url = "https://api.steamwebapi.com/steam/api/prices"
     resp = requests.get(
         url,
         params={"key": api_key, "market_hash_name": market_hash, "game": "csgo"},
