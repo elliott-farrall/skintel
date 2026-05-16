@@ -16,9 +16,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_PATH = os.getenv("SKINTEL_DB", "skintel.db")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-DISCORD_USER_ID   = os.getenv("DISCORD_USER_ID", "")
+DB_PATH             = os.getenv("SKINTEL_DB", "skintel.db")
+DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "")
+STEAM_SESSION_COOKIE = os.getenv("STEAM_SESSION_COOKIE", "")
 
 APPID = 730
 ATH_PROXIMITY = 0.95     # alert if current >= 95% of all-time high
@@ -135,11 +136,17 @@ def get_inventory(steam_id: str, api_key: str) -> list[dict]:
 
 
 def fetch_price_history(market_hash: str) -> list[dict]:
-    """Fetch price history from Steam market directly (no API key needed)."""
+    """Fetch price history from Steam market (requires steamLoginSecure cookie)."""
+    if not STEAM_SESSION_COOKIE:
+        log.warning("STEAM_SESSION_COOKIE not set — skipping history fetch")
+        return []
     resp = requests.get(
         "https://steamcommunity.com/market/pricehistory/",
         params={"appid": APPID, "market_hash_name": market_hash},
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": f"steamLoginSecure={STEAM_SESSION_COOKIE}",
+        },
         timeout=30,
     )
     if resp.status_code == 429:
