@@ -350,39 +350,21 @@ async function loadChart(skinId) {
 async function triggerRun() {
   const btn = document.getElementById("run-btn");
   btn.disabled = true;
-  btn.innerHTML = `<span class="spinner"></span>Running…`;
+  btn.textContent = "Queuing…";
 
   try {
     const res = await fetch("/api/run", { method: "POST" });
     const data = await res.json();
-    if (data.status === "already_running") {
-      btn.textContent = "Already running";
-      setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 3000);
-      return;
+    if (data.status === "dispatched") {
+      btn.textContent = "Queued ✓";
+    } else {
+      btn.textContent = data.error || "Error";
     }
-    // Poll status until done, then reload
-    pollUntilDone();
   } catch {
-    btn.disabled = false;
-    btn.textContent = "Run Now";
+    btn.textContent = "Error";
   }
-}
 
-async function pollUntilDone() {
-  const btn = document.getElementById("run-btn");
-  while (true) {
-    await sleep(5000);
-    try {
-      const res = await fetch("/api/status");
-      const data = await res.json();
-      if (!data.running) {
-        await load();
-        btn.disabled = false;
-        btn.textContent = "Run Now";
-        return;
-      }
-    } catch { /* keep polling */ }
-  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = "Run Now"; }, 8000);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
