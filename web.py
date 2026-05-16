@@ -111,7 +111,7 @@ def api_skins():
         ORDER BY alerted_at DESC
     """).fetchall()
 
-    # Fetch chart history for all skins in one query (newest 90 per skin)
+    # Fetch chart history for all skins in one query (newest 30 per skin)
     skin_ids = [s["id"] for s in skins]
     history_by_skin: dict[int, list] = {}
     if skin_ids:
@@ -124,7 +124,7 @@ def api_skins():
                 FROM prices
                 WHERE skin_id IN ({placeholders}) AND median_price IS NOT NULL
             )
-            WHERE rn <= 90
+            WHERE rn <= 30
             ORDER BY skin_id, fetched_at ASC
         """, skin_ids).fetchall()
         for row in hist_rows:
@@ -206,13 +206,12 @@ def api_status():
     })
 
 
-if __name__ == "__main__":
+def _startup() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-
     conn = sqlite3.connect(tr.DB_PATH)
     tr.init_db(conn)
     conn.close()
@@ -221,5 +220,10 @@ if __name__ == "__main__":
     scheduler.add_job(run_collect, "interval", hours=SCHEDULE_HOURS)
     scheduler.start()
 
+
+# Runs under both gunicorn (module import) and `python web.py` (direct)
+_startup()
+
+if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, use_reloader=False)

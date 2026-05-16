@@ -26,6 +26,16 @@ ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL         = os.getenv("SKINTEL_CLAUDE_MODEL", "claude-haiku-4-5")
 MIN_SELL_PRICE       = float(os.getenv("MIN_SELL_PRICE", "1.00"))  # GBP — skip cheaper skins entirely
 
+# Lazy singleton — constructed once on first use to avoid startup overhead
+_anthropic_client: "anthropic.Anthropic | None" = None
+
+
+def _get_anthropic_client() -> "anthropic.Anthropic":
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
 APPID = 730
 
 ALERT_COLORS = {
@@ -424,9 +434,8 @@ def check_sell_signal(
         f"Price history (oldest → newest):\n{history_lines}"
     )
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
-        resp = client.messages.create(
+        resp = _get_anthropic_client().messages.create(
             model=CLAUDE_MODEL,
             max_tokens=200,
             system=(
